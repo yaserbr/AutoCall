@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import {
   NativeModules,
+  Platform,
   PermissionsAndroid,
   StyleSheet,
   Text,
@@ -21,6 +22,26 @@ type CallCommand = {
 
 export default function Index() {
   const [nextCall, setNextCall] = useState<CallCommand | null>(null);
+
+  const requestCallPermission = async (): Promise<boolean> => {
+    if (Platform.OS !== "android") return true;
+
+    const hasPermission = await PermissionsAndroid.check(
+      PermissionsAndroid.PERMISSIONS.CALL_PHONE
+    );
+    if (hasPermission) return true;
+
+    const result = await PermissionsAndroid.request(
+      PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+      {
+        title: "Phone Call Permission",
+        message: "AutoCall needs permission to make phone calls",
+        buttonPositive: "OK",
+      }
+    );
+
+    return result === PermissionsAndroid.RESULTS.GRANTED;
+  };
 
   const getScheduledTime = (command: CallCommand) => {
     if (!command.scheduledAt) return 0; // ���� ��� = ����
@@ -52,6 +73,12 @@ export default function Index() {
   };
 
   const makeCall = async (phoneNumber: string, id: string) => {
+    const hasPermission = await requestCallPermission();
+    if (!hasPermission) {
+      console.log("Permission denied");
+      return;
+    }
+
     try {
       await fetch(`${SERVER}/commands/${id}/status`, {
         method: "POST",
@@ -109,9 +136,7 @@ export default function Index() {
     let pl: ReturnType<typeof setInterval>;
 
     const init = async () => {
-      await PermissionsAndroid.request(
-        PermissionsAndroid.PERMISSIONS.CALL_PHONE
-      );
+      await requestCallPermission();
 
       await register();
       await poll();

@@ -8,10 +8,16 @@
     "scheme": "autocallapp",
     "userInterfaceStyle": "automatic",
     "newArchEnabled": true,
+
     "ios": {
       "supportsTablet": true
     },
+
     "android": {
+      "permissions": [
+        "CALL_PHONE",
+        "INTERNET"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -22,10 +28,12 @@
       "predictiveBackGestureEnabled": false,
       "package": "com.yaser8541.autocallapp"
     },
+
     "web": {
       "output": "static",
       "favicon": "./assets/images/favicon.png"
     },
+
     "plugins": [
       "expo-router",
       [
@@ -41,9 +49,17 @@
         }
       ]
     ],
+
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+
+    "extra": {
+      "router": {},
+      "eas": {
+        "projectId": "7c94752f-bcb8-4cae-b0f2-adf78607f57b"
+      }
     }
   }
 }
