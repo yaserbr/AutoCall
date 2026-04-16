@@ -40,4 +40,8 @@ app-example
 
 # generated native folders
 /ios
-/android
+# keep /android included because this app contains custom native call code
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties

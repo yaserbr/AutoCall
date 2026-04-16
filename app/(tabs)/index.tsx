@@ -1,15 +1,20 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
+  AppState,
   NativeModules,
-  Platform,
   PermissionsAndroid,
+  Platform,
+  Pressable,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from "react-native";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
 const deviceUid = "device_123";
+const LOG_PREFIX = "[AutoCall]";
+const DEFAULT_TEST_PHONE = "+15555550123";
 
 type CallCommand = {
   id: string;
@@ -20,31 +25,83 @@ type CallCommand = {
   scheduledAt?: string;
 };
 
+type DirectCallResult = {
+  action: string;
+  phoneNumber: string;
+  usedCurrentActivity: boolean;
+  timestamp: string;
+};
+
+type DirectCallNativeModule = {
+  call(phoneNumber: string): Promise<DirectCallResult>;
+};
+
+const logEvent = (event: string, payload?: unknown) => {
+  if (payload !== undefined) {
+    console.log(`${LOG_PREFIX} ${event}`, payload);
+    return;
+  }
+
+  console.log(`${LOG_PREFIX} ${event}`);
+};
+
+const normalizePhoneNumber = (input: string): string | null => {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+
+  const normalized = trimmed.replace(/[^\d+]/g, "");
+  const plusCount = (normalized.match(/\+/g) ?? []).length;
+  if (plusCount > 1 || (plusCount === 1 && !normalized.startsWith("+"))) {
+    return null;
+  }
+
+  const onlyDigits = normalized.replace(/\+/g, "");
+  if (!onlyDigits) return null;
+
+  return normalized;
+};
+
 export default function Index() {
   const [nextCall, setNextCall] = useState<CallCommand | null>(null);
+  const [testPhoneNumber, setTestPhoneNumber] = useState(DEFAULT_TEST_PHONE);
+  const inFlightCommandIds = useRef<Set<string>>(new Set());
 
-  const requestCallPermission = async (): Promise<boolean> => {
+  const requestCallPermission = async (source: string): Promise<boolean> => {
     if (Platform.OS !== "android") return true;
 
-    const hasPermission = await PermissionsAndroid.check(
-      PermissionsAndroid.PERMISSIONS.CALL_PHONE
-    );
-    if (hasPermission) return true;
+    try {
+      const hasPermission = await PermissionsAndroid.check(
+        PermissionsAndroid.PERMISSIONS.CALL_PHONE
+      );
+      logEvent("runtime_permission_check", { source, hasPermission });
 
-    const result = await PermissionsAndroid.request(
-      PermissionsAndroid.PERMISSIONS.CALL_PHONE,
-      {
-        title: "Phone Call Permission",
-        message: "AutoCall needs permission to make phone calls",
-        buttonPositive: "OK",
-      }
-    );
+      if (hasPermission) return true;
 
-    return result === PermissionsAndroid.RESULTS.GRANTED;
+      const result = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+        {
+          title: "Phone Call Permission",
+          message: "AutoCall needs permission to make phone calls",
+          buttonPositive: "OK",
+          buttonNegative: "Cancel",
+        }
+      );
+
+      const granted = result === PermissionsAndroid.RESULTS.GRANTED;
+      logEvent("runtime_permission_request_result", {
+        source,
+        result,
+        granted,
+      });
+      return granted;
+    } catch (error) {
+      logEvent("runtime_permission_error", { source, error });
+      return false;
+    }
   };
 
   const getScheduledTime = (command: CallCommand) => {
-    if (!command.scheduledAt) return 0; // ���� ��� = ����
+    if (!command.scheduledAt) return 0;
     const time = new Date(command.scheduledAt).getTime();
     return Number.isNaN(time) ? 0 : time;
   };
@@ -57,78 +114,176 @@ export default function Index() {
   };
 
   const register = async () => {
-    await fetch(`${SERVER}/devices/register`, {
+    logEvent("register_start", { deviceUid });
+    const response = await fetch(`${SERVER}/devices/register`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ deviceUid }),
     });
+    logEvent("register_done", { status: response.status });
   };
 
   const heartbeat = async () => {
-    await fetch(`${SERVER}/devices/heartbeat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceUid }),
-    });
+    try {
+      const response = await fetch(`${SERVER}/devices/heartbeat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deviceUid }),
+      });
+      logEvent("heartbeat_done", { status: response.status });
+    } catch (error) {
+      logEvent("heartbeat_error", { error });
+    }
   };
 
-  const makeCall = async (phoneNumber: string, id: string) => {
-    const hasPermission = await requestCallPermission();
-    if (!hasPermission) {
-      console.log("Permission denied");
-      return;
+  const updateCommandStatus = async (id: string, status: string) => {
+    try {
+      const response = await fetch(`${SERVER}/commands/${id}/status`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      logEvent("command_status_update", { id, status, http: response.status });
+    } catch (error) {
+      logEvent("command_status_update_error", { id, status, error });
+    }
+  };
+
+  const getDirectCallModule = (): DirectCallNativeModule | null => {
+    const moduleCandidate = (NativeModules as { DirectCall?: unknown }).DirectCall;
+
+    if (!moduleCandidate) {
+      logEvent("native_module_missing", { hasDirectCall: false });
+      return null;
+    }
+
+    const directCall = moduleCandidate as Partial<DirectCallNativeModule>;
+    if (typeof directCall.call !== "function") {
+      logEvent("native_module_invalid_shape", { hasCallMethod: false });
+      return null;
+    }
+
+    return directCall as DirectCallNativeModule;
+  };
+
+  const executeDirectCall = async (
+    rawPhoneNumber: string,
+    source: "server-command" | "manual-debug",
+    commandId?: string
+  ): Promise<boolean> => {
+    logEvent("call_flow_entered", {
+      source,
+      commandId,
+      rawPhoneNumber,
+      appState: AppState.currentState,
+    });
+
+    const phoneNumber = normalizePhoneNumber(rawPhoneNumber);
+    if (!phoneNumber) {
+      logEvent("call_flow_invalid_number", { source, commandId, rawPhoneNumber });
+      if (commandId) {
+        await updateCommandStatus(commandId, "failed");
+      }
+      return false;
     }
 
     try {
-      await fetch(`${SERVER}/commands/${id}/status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "executing" }),
+      if (commandId) {
+        inFlightCommandIds.current.add(commandId);
+        await updateCommandStatus(commandId, "executing");
+      }
+
+      const hasPermission = await requestCallPermission(source);
+      if (!hasPermission) {
+        logEvent("call_flow_permission_denied", { source, commandId, phoneNumber });
+        if (commandId) {
+          await updateCommandStatus(commandId, "failed");
+        }
+        return false;
+      }
+
+      const directCall = getDirectCallModule();
+      if (!directCall) {
+        if (commandId) {
+          await updateCommandStatus(commandId, "failed");
+        }
+        return false;
+      }
+
+      logEvent("native_call_invocation_start", { source, commandId, phoneNumber });
+      const nativeResult = await directCall.call(phoneNumber);
+      logEvent("native_call_invocation_success", {
+        source,
+        commandId,
+        phoneNumber,
+        nativeResult,
       });
 
-      const { DirectCall } = NativeModules;
-      DirectCall.call(phoneNumber);
-
-      await fetch(`${SERVER}/commands/${id}/status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "executed" }),
+      if (commandId) {
+        await updateCommandStatus(commandId, "executed");
+      }
+      return true;
+    } catch (error) {
+      logEvent("native_call_invocation_error", {
+        source,
+        commandId,
+        phoneNumber,
+        error,
       });
-    } catch {
-      await fetch(`${SERVER}/commands/${id}/status`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status: "failed" }),
-      });
+      if (commandId) {
+        await updateCommandStatus(commandId, "failed");
+      }
+      return false;
+    } finally {
+      if (commandId) {
+        inFlightCommandIds.current.delete(commandId);
+      }
     }
   };
 
   const poll = async () => {
-    const res = await fetch(
-      `${SERVER}/commands?deviceUid=${deviceUid}&status=pending`
-    );
+    try {
+      const response = await fetch(
+        `${SERVER}/commands?deviceUid=${deviceUid}&status=pending`
+      );
+      logEvent("poll_response", { status: response.status });
 
-    const data = (await res.json()) as CallCommand[];
-
-    const callCommands = data
-      .filter((cmd) => cmd.type === "CALL")
-      .sort((a, b) => getScheduledTime(a) - getScheduledTime(b));
-
-    if (callCommands.length === 0) {
-      setNextCall(null);
-      return;
-    }
-
-    setNextCall(callCommands[0]);
-
-    callCommands.forEach((cmd) => {
-      const scheduledTime = getScheduledTime(cmd);
-      const shouldRunNow = !cmd.scheduledAt || Date.now() >= scheduledTime;
-
-      if (shouldRunNow) {
-        makeCall(cmd.phoneNumber, cmd.id);
+      if (!response.ok) {
+        return;
       }
-    });
+
+      const data = (await response.json()) as CallCommand[];
+
+      const callCommands = data
+        .filter((cmd) => cmd.type === "CALL")
+        .sort((a, b) => getScheduledTime(a) - getScheduledTime(b));
+
+      if (callCommands.length === 0) {
+        setNextCall(null);
+        return;
+      }
+
+      setNextCall(callCommands[0]);
+      logEvent("server_command_received", {
+        count: callCommands.length,
+        nextCommand: callCommands[0],
+      });
+
+      callCommands.forEach((cmd) => {
+        const scheduledTime = getScheduledTime(cmd);
+        const shouldRunNow = !cmd.scheduledAt || Date.now() >= scheduledTime;
+
+        if (!shouldRunNow) return;
+        if (inFlightCommandIds.current.has(cmd.id)) {
+          logEvent("server_command_skipped_inflight", { commandId: cmd.id });
+          return;
+        }
+
+        void executeDirectCall(cmd.phoneNumber, "server-command", cmd.id);
+      });
+    } catch (error) {
+      logEvent("poll_error", { error });
+    }
   };
 
   useEffect(() => {
@@ -136,21 +291,36 @@ export default function Index() {
     let pl: ReturnType<typeof setInterval>;
 
     const init = async () => {
-      await requestCallPermission();
+      logEvent("app_init_start");
+      await requestCallPermission("startup");
 
-      await register();
+      try {
+        await register();
+      } catch (error) {
+        logEvent("register_error", { error });
+      }
+
       await poll();
 
-      hb = setInterval(heartbeat, 10000);
-      pl = setInterval(poll, 10000);
+      hb = setInterval(() => {
+        void heartbeat();
+      }, 10000);
+      pl = setInterval(() => {
+        void poll();
+      }, 10000);
+
+      logEvent("app_init_done");
     };
 
-    init();
+    void init();
 
     return () => {
+      logEvent("app_cleanup");
       if (hb) clearInterval(hb);
       if (pl) clearInterval(pl);
     };
+    // Intentional one-time startup flow for device registration/poll timers.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
@@ -182,6 +352,25 @@ export default function Index() {
           <Text style={styles.nextCallTime}>
             {nextCall ? formatCallTime(nextCall.scheduledAt) : "Now"}
           </Text>
+        </View>
+
+        <View style={styles.testBox}>
+          <Text style={styles.nextCallTitle}>Manual Foreground Test</Text>
+          <TextInput
+            value={testPhoneNumber}
+            onChangeText={setTestPhoneNumber}
+            placeholder="+15555550123"
+            placeholderTextColor="rgba(215, 229, 252, 0.58)"
+            keyboardType="phone-pad"
+            style={styles.input}
+          />
+          <Pressable
+            style={styles.callButton}
+            onPress={() => {
+              void executeDirectCall(testPhoneNumber, "manual-debug");
+            }}>
+            <Text style={styles.callButtonText}>Trigger Direct Call</Text>
+          </Pressable>
         </View>
       </View>
     </View>
@@ -306,5 +495,39 @@ const styles = StyleSheet.create({
     color: "rgba(233, 241, 255, 0.9)",
     fontSize: 14,
     fontWeight: "500",
+  },
+  testBox: {
+    marginTop: 14,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(95, 246, 202, 0.35)",
+    backgroundColor: "rgba(7, 16, 36, 0.42)",
+    paddingVertical: 12,
+    paddingHorizontal: 14,
+  },
+  input: {
+    marginTop: 6,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.26)",
+    borderRadius: 10,
+    backgroundColor: "rgba(255, 255, 255, 0.08)",
+    color: "#ffffff",
+    paddingHorizontal: 12,
+    paddingVertical: 10,
+    fontSize: 16,
+    fontWeight: "600",
+  },
+  callButton: {
+    marginTop: 10,
+    borderRadius: 10,
+    backgroundColor: "#3ee5c8",
+    paddingVertical: 11,
+    alignItems: "center",
+  },
+  callButtonText: {
+    color: "#06211d",
+    fontSize: 15,
+    fontWeight: "800",
+    letterSpacing: 0.25,
   },
 });
