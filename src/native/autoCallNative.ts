@@ -15,8 +15,18 @@ type OutgoingCallResult = {
   timestamp: number;
 };
 
+type SimpleCallResult = {
+  success: boolean;
+  reason: string;
+  message: string;
+  phoneNumber: string | null;
+  autoEndMs: number | null;
+  timestamp: number;
+};
+
 type AutoCallNativeModule = {
   startOutgoingCall(phoneNumber: string): Promise<OutgoingCallResult>;
+  startSimpleCall(phoneNumber: string, autoEndMs: number | null): Promise<SimpleCallResult>;
   enableAutoAnswer(config: { autoHangupSeconds: number }): Promise<AutoAnswerStatus>;
   disableAutoAnswer(): Promise<AutoAnswerStatus>;
   getAutoAnswerStatus(): Promise<AutoAnswerStatus>;
@@ -32,6 +42,9 @@ const getNativeModule = (): AutoCallNativeModule => {
 };
 
 export const placeCall = (phoneNumber: string) => getNativeModule().startOutgoingCall(phoneNumber);
+
+export const startSimpleCall = (phoneNumber: string, autoEndMs?: number | null) =>
+  getNativeModule().startSimpleCall(phoneNumber, autoEndMs ?? null);
 
 export const enableAutoAnswer = (autoHangupSeconds: number) =>
   getNativeModule().enableAutoAnswer({ autoHangupSeconds });

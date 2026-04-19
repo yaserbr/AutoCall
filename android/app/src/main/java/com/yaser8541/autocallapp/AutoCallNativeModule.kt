@@ -52,6 +52,50 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun startSimpleCall(phoneNumber: String, autoEndMs: Double?, promise: Promise) {
+        Log.i(TAG, "Simple call command received phone=$phoneNumber autoEndMs=$autoEndMs")
+        UiThreadUtil.runOnUiThread {
+            try {
+                val result = SimpleCallManager.startSimpleCall(
+                    context = reactContext,
+                    rawPhoneNumber = phoneNumber,
+                    autoEndMs = autoEndMs,
+                    activity = reactContext.currentActivity
+                )
+
+                val map = Arguments.createMap().apply {
+                    putBoolean("success", result.success)
+                    putString("reason", result.reason)
+                    putString("message", result.message)
+                    if (result.phoneNumber != null) {
+                        putString("phoneNumber", result.phoneNumber)
+                    } else {
+                        putNull("phoneNumber")
+                    }
+                    if (result.autoEndMs != null) {
+                        putDouble("autoEndMs", result.autoEndMs.toDouble())
+                    } else {
+                        putNull("autoEndMs")
+                    }
+                    putDouble("timestamp", result.timestamp.toDouble())
+                }
+                promise.resolve(map)
+            } catch (error: Throwable) {
+                Log.e(TAG, "startSimpleCall failed", error)
+                val map = Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putString("reason", "start_simple_call_failed")
+                    putString("message", error.message ?: "Unexpected error while starting simple call")
+                    putNull("phoneNumber")
+                    putNull("autoEndMs")
+                    putDouble("timestamp", System.currentTimeMillis().toDouble())
+                }
+                promise.resolve(map)
+            }
+        }
+    }
+
+    @ReactMethod
     fun enableAutoAnswer(config: ReadableMap?, promise: Promise) {
         try {
             val requestedSeconds = if (
@@ -105,7 +149,12 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     fun endCurrentCall(promise: Promise) {
         try {
             Log.i(TAG, "Ending current call")
-            val ended = AutoAnswerController.endCurrentCall(reactContext, "Ending current call")
+            val endedBySimpleCallManager = SimpleCallManager.endCurrentCall(reactContext)
+            val ended = if (endedBySimpleCallManager) {
+                true
+            } else {
+                AutoAnswerController.endCurrentCall(reactContext, "Ending current call")
+            }
             val map = Arguments.createMap().apply {
                 putBoolean("ended", ended)
             }

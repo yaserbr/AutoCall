@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+﻿import { useEffect, useRef, useState } from "react";
 import {
   PermissionsAndroid,
   Platform,
@@ -16,6 +16,7 @@ import {
   endCurrentCall,
   getStatus,
   placeCall,
+  startSimpleCall,
 } from "../../src/native/autoCallNative";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
@@ -23,6 +24,8 @@ const DEVICE_UID = "device_123";
 const POLL_INTERVAL_MS = 10000;
 const DEFAULT_PHONE = "05";
 const DEFAULT_HANGUP_SECONDS = 20;
+const DEFAULT_SIMPLE_CALL_DURATION_SECONDS = 20;
+const MAX_SIMPLE_CALL_DURATION_SECONDS = 3600;
 const LOG_PREFIX = "[AutoCall/UI]";
 
 type ServerCallCommand = {
@@ -84,6 +87,9 @@ export default function AutoCallScreen() {
   const [statusMessage, setStatusMessage] = useState("Ready");
   const [phoneNumber, setPhoneNumber] = useState(DEFAULT_PHONE);
   const [autoHangupSecondsText, setAutoHangupSecondsText] = useState(String(DEFAULT_HANGUP_SECONDS));
+  const [simpleCallDurationSecondsText, setSimpleCallDurationSecondsText] = useState(
+    String(DEFAULT_SIMPLE_CALL_DURATION_SECONDS)
+  );
   const [nextServerCommand, setNextServerCommand] = useState<ServerCallCommand | null>(null);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
 
@@ -169,6 +175,21 @@ export default function AutoCallScreen() {
     }
   };
 
+  const parseSimpleCallDurationMs = (): number | null => {
+    const trimmed = simpleCallDurationSecondsText.trim();
+    if (!trimmed) {
+      return null;
+    }
+
+    const parsedSeconds = Number.parseInt(trimmed, 10);
+    if (Number.isNaN(parsedSeconds) || parsedSeconds <= 0) {
+      return null;
+    }
+
+    const clamped = Math.min(parsedSeconds, MAX_SIMPLE_CALL_DURATION_SECONDS);
+    return clamped * 1000;
+  };
+
   const executeOutgoingCall = async (
     rawPhoneNumber: string,
     source: "server" | "manual",
@@ -201,7 +222,19 @@ export default function AutoCallScreen() {
         logEvent("Outgoing call command received", { phoneNumber: normalized, commandId });
       }
 
-      await placeCall(normalized);
+      if (source === "manual") {
+        const autoEndMs = parseSimpleCallDurationMs();
+        const callResult = await startSimpleCall(normalized, autoEndMs);
+        if (!callResult.success) {
+          setStatusMessage(`Call rejected: ${callResult.message}`);
+          if (commandId) {
+            await updateCommandStatus(commandId, "failed");
+          }
+          return false;
+        }
+      } else {
+        await placeCall(normalized);
+      }
       await refreshStatus();
 
       if (commandId) {
@@ -378,10 +411,30 @@ export default function AutoCallScreen() {
             value={phoneNumber}
             onChangeText={setPhoneNumber}
             keyboardType="phone-pad"
-            style={styles.input}
+            autoCorrect={false}
+            autoCapitalize="none"
+            selectionColor="#ffffff"
+            cursorColor="#ffffff"
+            underlineColorAndroid="transparent"
+            style={[styles.input, styles.fullInput, styles.visibleInput]}
             placeholder="05xxxxxxxx"
             placeholderTextColor="#8ca0bf"
           />
+          <Text style={[styles.label, styles.durationLabel]}>Call Duration (seconds)</Text>
+          <TextInput
+            value={simpleCallDurationSecondsText}
+            onChangeText={setSimpleCallDurationSecondsText}
+            keyboardType="number-pad"
+            autoCorrect={false}
+            autoCapitalize="none"
+            selectionColor="#ffffff"
+            cursorColor="#ffffff"
+            underlineColorAndroid="transparent"
+            style={[styles.input, styles.fullInput, styles.visibleInput]}
+            placeholder="5"
+            placeholderTextColor="#8ca0bf"
+          />
+          <Text style={styles.helperText}>مدة المكالمة تبدأ من لحظة بدء الاتصال</Text>
 
           <View style={styles.row}>
             <Pressable style={styles.primaryButton} onPress={onCallNow}>
@@ -438,7 +491,7 @@ const styles = StyleSheet.create({
     color: "#b8c7de",
   },
   section: {
-    marginTop: 10,
+    marginTop: 20,
     padding: 12,
     borderRadius: 12,
     backgroundColor: "#152037",
@@ -462,6 +515,14 @@ const styles = StyleSheet.create({
     fontWeight: "600",
     color: "#dde7f8",
   },
+  durationLabel: {
+    marginTop: 10,
+  },
+  helperText: {
+    marginTop: 6,
+    fontSize: 12,
+    color: "#9eb0cc",
+  },
   input: {
     flex: 1,
     borderWidth: 1,
@@ -472,6 +533,16 @@ const styles = StyleSheet.create({
     color: "#ffffff",
     backgroundColor: "#101a2d",
   },
+  fullInput: {
+    width: "100%",
+  },
+  visibleInput: {
+    minHeight: 46,
+    paddingVertical: 10,
+    fontSize: 18,
+    textAlignVertical: "center",
+    textAlign: "left",
+  },
   secondsInput: {
     maxWidth: 120,
   },
@@ -481,10 +552,12 @@ const styles = StyleSheet.create({
     backgroundColor: "#27c596",
     paddingVertical: 10,
     alignItems: "center",
+
   },
   primaryButtonText: {
     color: "#062019",
     fontWeight: "700",
+    
   },
   secondaryButton: {
     borderRadius: 10,
@@ -509,7 +582,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   statusBox: {
-    marginTop: 12,
+    marginTop: 50,
     borderRadius: 12,
     backgroundColor: "#101b2f",
     borderWidth: 1,
