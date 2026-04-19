@@ -1,4 +1,4 @@
-﻿import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   PermissionsAndroid,
   Platform,
@@ -15,7 +15,6 @@ import {
   enableAutoAnswer,
   endCurrentCall,
   getStatus,
-  placeCall,
   startSimpleCall,
 } from "../../src/native/autoCallNative";
 
@@ -33,6 +32,7 @@ type ServerCallCommand = {
   deviceUid: string;
   type: "CALL";
   phoneNumber: string;
+  durationSeconds?: number | null;
   status: string;
   scheduledAt?: string;
 };
@@ -190,10 +190,20 @@ export default function AutoCallScreen() {
     return clamped * 1000;
   };
 
+  const parseServerCommandDurationMs = (durationSeconds?: number | null): number | null => {
+    if (typeof durationSeconds !== "number" || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+      return null;
+    }
+
+    const clamped = Math.min(durationSeconds, MAX_SIMPLE_CALL_DURATION_SECONDS);
+    return Math.round(clamped * 1000);
+  };
+
   const executeOutgoingCall = async (
     rawPhoneNumber: string,
     source: "server" | "manual",
-    commandId?: string
+    commandId?: string,
+    commandDurationSeconds?: number | null
   ): Promise<boolean> => {
     const normalized = normalizePhoneNumber(rawPhoneNumber);
     if (!normalized) {
@@ -219,21 +229,24 @@ export default function AutoCallScreen() {
       }
 
       if (source === "server") {
-        logEvent("Outgoing call command received", { phoneNumber: normalized, commandId });
+        logEvent("Outgoing call command received", {
+          phoneNumber: normalized,
+          commandId,
+          durationSeconds: commandDurationSeconds ?? null,
+        });
       }
 
-      if (source === "manual") {
-        const autoEndMs = parseSimpleCallDurationMs();
-        const callResult = await startSimpleCall(normalized, autoEndMs);
-        if (!callResult.success) {
-          setStatusMessage(`Call rejected: ${callResult.message}`);
-          if (commandId) {
-            await updateCommandStatus(commandId, "failed");
-          }
-          return false;
+      const autoEndMs =
+        source === "server"
+          ? parseServerCommandDurationMs(commandDurationSeconds)
+          : parseSimpleCallDurationMs();
+      const callResult = await startSimpleCall(normalized, autoEndMs);
+      if (!callResult.success) {
+        setStatusMessage(`Call rejected: ${callResult.message}`);
+        if (commandId) {
+          await updateCommandStatus(commandId, "failed");
         }
-      } else {
-        await placeCall(normalized);
+        return false;
       }
       await refreshStatus();
 
@@ -280,7 +293,12 @@ export default function AutoCallScreen() {
         if (!dueNow) continue;
         if (inFlightCommandIds.current.has(command.id)) continue;
 
-        await executeOutgoingCall(command.phoneNumber, "server", command.id);
+        await executeOutgoingCall(
+          command.phoneNumber,
+          "server",
+          command.id,
+          command.durationSeconds ?? null
+        );
       }
     } catch (error) {
       logEvent("poll_commands_failed", { error });
@@ -434,11 +452,11 @@ export default function AutoCallScreen() {
             placeholder="5"
             placeholderTextColor="#8ca0bf"
           />
-          <Text style={styles.helperText}>مدة المكالمة تبدأ من لحظة بدء الاتصال</Text>
+          <Text style={styles.helperText}>Call duration starts from the moment the call begins.</Text>
 
           <View style={styles.row}>
             <Pressable style={styles.primaryButton} onPress={onCallNow}>
-              <Text style={styles.primaryButtonText}>اتصال الآن</Text>
+              <Text style={styles.primaryButtonText}>Call Now</Text>
             </Pressable>
             <Pressable style={styles.dangerButton} onPress={onEndCurrentCall}>
               <Text style={styles.dangerButtonText}>End Current Call</Text>
@@ -491,7 +509,7 @@ const styles = StyleSheet.create({
     color: "#b8c7de",
   },
   section: {
-    marginTop: 20,
+    marginTop: 12,
     padding: 12,
     borderRadius: 12,
     backgroundColor: "#152037",
@@ -508,7 +526,7 @@ const styles = StyleSheet.create({
     flexDirection: "row",
     gap: 8,
     alignItems: "center",
-    marginTop: 8,
+    marginTop: 12,
   },
   label: {
     fontSize: 14,
@@ -522,9 +540,9 @@ const styles = StyleSheet.create({
     marginTop: 6,
     fontSize: 12,
     color: "#9eb0cc",
+    lineHeight: 18,
   },
   input: {
-    flex: 1,
     borderWidth: 1,
     borderColor: "#34507a",
     borderRadius: 10,
@@ -544,7 +562,8 @@ const styles = StyleSheet.create({
     textAlign: "left",
   },
   secondsInput: {
-    maxWidth: 120,
+    width: 120,
+    flexShrink: 0,
   },
   primaryButton: {
     flex: 1,
@@ -552,12 +571,10 @@ const styles = StyleSheet.create({
     backgroundColor: "#27c596",
     paddingVertical: 10,
     alignItems: "center",
-
   },
   primaryButtonText: {
     color: "#062019",
     fontWeight: "700",
-    
   },
   secondaryButton: {
     borderRadius: 10,
@@ -582,7 +599,7 @@ const styles = StyleSheet.create({
     fontWeight: "700",
   },
   statusBox: {
-    marginTop: 50,
+    marginTop: 12,
     borderRadius: 12,
     backgroundColor: "#101b2f",
     borderWidth: 1,
