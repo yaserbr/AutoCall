@@ -153,15 +153,17 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     fun endCurrentCall(promise: Promise) {
         try {
             Log.i(TAG, "Ending current call")
-            val endedBySimpleCallManager = SimpleCallManager.endCurrentCall(reactContext)
-            val ended = if (endedBySimpleCallManager) {
-                true
-            } else {
-                AutoAnswerController.endCurrentCall(reactContext, "Ending current call")
-            }
+            val result = SimpleCallManager.endCurrentCall(reactContext)
             val map = Arguments.createMap().apply {
-                putBoolean("ended", ended)
+                putBoolean("ended", result.ended)
+                putString("reason", result.reason)
+                putBoolean("hasAnswerPhoneCallsPermission", result.hasAnswerPhoneCallsPermission)
             }
+            Log.i(
+                TAG,
+                "endCurrentCall result ended=${result.ended} reason=${result.reason} " +
+                    "hasAnswerPhoneCallsPermission=${result.hasAnswerPhoneCallsPermission}"
+            )
             promise.resolve(map)
         } catch (error: Throwable) {
             Log.e(TAG, "endCurrentCall failed", error)

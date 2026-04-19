@@ -30,8 +30,9 @@ const LOG_PREFIX = "[AutoCall/UI]";
 type ServerCallCommand = {
   id: string;
   deviceUid: string;
-  type: "CALL";
-  phoneNumber: string;
+  action?: "call" | "end";
+  type: "CALL" | "END";
+  phoneNumber?: string | null;
   durationSeconds?: number | null;
   status: string;
   scheduledAt?: string;
@@ -270,6 +271,33 @@ export default function AutoCallScreen() {
     }
   };
 
+  const executeEndCommand = async (commandId: string): Promise<boolean> => {
+    try {
+      inFlightCommandIds.current.add(commandId);
+      await updateCommandStatus(commandId, "executing");
+      console.log("End command received");
+      const result = await endCurrentCall();
+      await refreshStatus();
+
+      if (result.ended) {
+        await updateCommandStatus(commandId, "executed");
+        setStatusMessage("Current call ended from server command");
+        return true;
+      }
+
+      await updateCommandStatus(commandId, "failed");
+      setStatusMessage("Could not end current call from server command");
+      return false;
+    } catch (error) {
+      logEvent("execute_end_command_failed", { error, commandId });
+      await updateCommandStatus(commandId, "failed");
+      setStatusMessage("Failed to execute end command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
   const getScheduledAtMs = (command: ServerCallCommand): number => {
     if (!command.scheduledAt) return 0;
     const dateValue = new Date(command.scheduledAt).getTime();
@@ -282,16 +310,28 @@ export default function AutoCallScreen() {
       if (!response.ok) return;
 
       const commands = (await response.json()) as ServerCallCommand[];
-      const dueCallCommands = commands
-        .filter((command) => command.type === "CALL")
-        .sort((a, b) => getScheduledAtMs(a) - getScheduledAtMs(b));
+      const dueCommands = [...commands].sort((a, b) => getScheduledAtMs(a) - getScheduledAtMs(b));
 
-      setNextServerCommand(dueCallCommands[0] ?? null);
+      setNextServerCommand(dueCommands.find((command) => command.type === "CALL") ?? null);
 
-      for (const command of dueCallCommands) {
+      for (const command of dueCommands) {
         const dueNow = !command.scheduledAt || Date.now() >= getScheduledAtMs(command);
         if (!dueNow) continue;
         if (inFlightCommandIds.current.has(command.id)) continue;
+
+        const action =
+          command.action ??
+          (command.type === "END" ? "end" : "call");
+
+        if (action === "end") {
+          await executeEndCommand(command.id);
+          continue;
+        }
+
+        if (!command.phoneNumber) {
+          await updateCommandStatus(command.id, "failed");
+          continue;
+        }
 
         await executeOutgoingCall(
           command.phoneNumber,

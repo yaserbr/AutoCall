@@ -22,6 +22,13 @@ data class SimpleCallStartResult(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+data class SimpleCallEndResult(
+    val ended: Boolean,
+    val reason: String,
+    val hasAnswerPhoneCallsPermission: Boolean,
+    val timestamp: Long = System.currentTimeMillis()
+)
+
 object SimpleCallManager {
     private const val TAG = "AutoCall/SimpleCall"
 
@@ -123,7 +130,8 @@ object SimpleCallManager {
         }
     }
 
-    fun endCurrentCall(context: Context): Boolean {
+    fun endCurrentCall(context: Context): SimpleCallEndResult {
+        Log.i(TAG, "endCurrentCall invoked")
         cancelAutoEndTimer()
         return attemptEndCall(context.applicationContext)
     }
@@ -153,6 +161,7 @@ object SimpleCallManager {
     }
 
     private fun cancelAutoEndTimer() {
+        Log.i(TAG, "cancelAutoEndTimer called")
         synchronized(lock) {
             val runnable = pendingAutoEndRunnable ?: return
             Log.i(TAG, "cancelling previous auto-end timer")
@@ -161,22 +170,70 @@ object SimpleCallManager {
         }
     }
 
-    private fun attemptEndCall(context: Context): Boolean {
+    private fun attemptEndCall(context: Context): SimpleCallEndResult {
         Log.i(TAG, "attemptEndCall invoked")
+        val hasAnswerPhoneCallsPermission = ContextCompat.checkSelfPermission(
+            context,
+            Manifest.permission.ANSWER_PHONE_CALLS
+        ) == PackageManager.PERMISSION_GRANTED
+        Log.i(
+            TAG,
+            "ANSWER_PHONE_CALLS runtime granted=$hasAnswerPhoneCallsPermission"
+        )
+        if (!hasAnswerPhoneCallsPermission) {
+            Log.w(TAG, "endCall blocked: missing ANSWER_PHONE_CALLS permission")
+            Log.i(TAG, "endCall result=false")
+            return SimpleCallEndResult(
+                ended = false,
+                reason = "missing_answer_phone_calls_permission",
+                hasAnswerPhoneCallsPermission = false
+            )
+        }
+
         val telecomManager = context.getSystemService(Context.TELECOM_SERVICE) as TelecomManager?
+        Log.i(TAG, "telecomManager == null: ${telecomManager == null}")
         if (telecomManager == null) {
             Log.i(TAG, "endCall result=false")
-            return false
+            return SimpleCallEndResult(
+                ended = false,
+                reason = "telecom_manager_unavailable",
+                hasAnswerPhoneCallsPermission = hasAnswerPhoneCallsPermission
+            )
         }
 
         return try {
             @Suppress("DEPRECATION")
             val ended = telecomManager.endCall()
             Log.i(TAG, "endCall result=$ended")
-            ended
+            if (ended) {
+                SimpleCallEndResult(
+                    ended = true,
+                    reason = "ended",
+                    hasAnswerPhoneCallsPermission = hasAnswerPhoneCallsPermission
+                )
+            } else {
+                SimpleCallEndResult(
+                    ended = false,
+                    reason = "end_call_returned_false",
+                    hasAnswerPhoneCallsPermission = hasAnswerPhoneCallsPermission
+                )
+            }
+        } catch (error: SecurityException) {
+            Log.e(TAG, "SecurityException while ending call", error)
+            Log.i(TAG, "endCall result=false")
+            SimpleCallEndResult(
+                ended = false,
+                reason = "security_exception",
+                hasAnswerPhoneCallsPermission = hasAnswerPhoneCallsPermission
+            )
         } catch (error: Throwable) {
-            Log.e(TAG, "endCall exception", error)
-            false
+            Log.e(TAG, "Throwable while ending call", error)
+            Log.i(TAG, "endCall result=false")
+            SimpleCallEndResult(
+                ended = false,
+                reason = "unknown_exception",
+                hasAnswerPhoneCallsPermission = hasAnswerPhoneCallsPermission
+            )
         }
     }
 

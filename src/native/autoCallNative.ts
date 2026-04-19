@@ -53,4 +53,6 @@ export const disableAutoAnswer = () => getNativeModule().disableAutoAnswer();
 
 export const getStatus = () => getNativeModule().getAutoAnswerStatus();
 
-export const endCurrentCall = () => getNativeModule().endCurrentCall();
+export const endCurrentCall = async () => {
+  return getNativeModule().endCurrentCall();
+};
