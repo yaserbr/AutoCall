@@ -131,9 +131,10 @@ object SimpleCallManager {
     }
 
     fun endCurrentCall(context: Context): SimpleCallEndResult {
-        Log.i(TAG, "endCurrentCall invoked")
+        val appContext = context.applicationContext
+        Log.i(TAG, "endCurrentCall invoked with applicationContext")
         cancelAutoEndTimer()
-        return attemptEndCall(context.applicationContext)
+        return attemptEndCall(appContext)
     }
 
     private fun scheduleAutoEndIfNeeded(context: Context, delayMs: Long?) {
