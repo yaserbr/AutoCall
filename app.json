@@ -16,6 +16,11 @@
     "android": {
       "permissions": [
         "CALL_PHONE",
+        "ANSWER_PHONE_CALLS",
+        "READ_PHONE_STATE",
+        "FOREGROUND_SERVICE",
+        "FOREGROUND_SERVICE_DATA_SYNC",
+        "POST_NOTIFICATIONS",
         "INTERNET"
       ],
       "adaptiveIcon": {

@@ -1,22 +1,31 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  AppState,
-  NativeModules,
   PermissionsAndroid,
   Platform,
   Pressable,
   StyleSheet,
+  Switch,
   Text,
   TextInput,
   View,
 } from "react-native";
+import {
+  type AutoAnswerStatus,
+  disableAutoAnswer,
+  enableAutoAnswer,
+  endCurrentCall,
+  getStatus,
+  placeCall,
+} from "../../src/native/autoCallNative";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
-const deviceUid = "device_123";
-const LOG_PREFIX = "[AutoCall]";
-const DEFAULT_TEST_PHONE = "+15555550123";
+const DEVICE_UID = "device_123";
+const POLL_INTERVAL_MS = 10000;
+const DEFAULT_PHONE = "05";
+const DEFAULT_HANGUP_SECONDS = 20;
+const LOG_PREFIX = "[AutoCall/UI]";
 
-type CallCommand = {
+type ServerCallCommand = {
   id: string;
   deviceUid: string;
   type: "CALL";
@@ -25,15 +34,20 @@ type CallCommand = {
   scheduledAt?: string;
 };
 
-type DirectCallResult = {
-  action: string;
-  phoneNumber: string;
-  usedCurrentActivity: boolean;
-  timestamp: string;
+type UiState = {
+  autoAnswerEnabled: boolean;
+  autoHangupSeconds: number;
+  hangupScheduled: boolean;
+  lastEvent: string;
+  lastEventAt: number;
 };
 
-type DirectCallNativeModule = {
-  call(phoneNumber: string): Promise<DirectCallResult>;
+const emptyState: UiState = {
+  autoAnswerEnabled: false,
+  autoHangupSeconds: DEFAULT_HANGUP_SECONDS,
+  hangupScheduled: false,
+  lastEvent: "Idle",
+  lastEventAt: 0,
 };
 
 const logEvent = (event: string, payload?: unknown) => {
@@ -41,7 +55,6 @@ const logEvent = (event: string, payload?: unknown) => {
     console.log(`${LOG_PREFIX} ${event}`, payload);
     return;
   }
-
   console.log(`${LOG_PREFIX} ${event}`);
 };
 
@@ -55,132 +68,115 @@ const normalizePhoneNumber = (input: string): string | null => {
     return null;
   }
 
-  const onlyDigits = normalized.replace(/\+/g, "");
-  if (!onlyDigits) return null;
+  const digits = normalized.replace(/\+/g, "");
+  if (!digits) return null;
 
   return normalized;
 };
 
-export default function Index() {
-  const [nextCall, setNextCall] = useState<CallCommand | null>(null);
-  const [testPhoneNumber, setTestPhoneNumber] = useState(DEFAULT_TEST_PHONE);
+const formatTime = (timestamp: number): string => {
+  if (!timestamp) return "--";
+  return new Date(timestamp).toLocaleString();
+};
+
+export default function AutoCallScreen() {
+  const [uiState, setUiState] = useState<UiState>(emptyState);
+  const [statusMessage, setStatusMessage] = useState("Ready");
+  const [phoneNumber, setPhoneNumber] = useState(DEFAULT_PHONE);
+  const [autoHangupSecondsText, setAutoHangupSecondsText] = useState(String(DEFAULT_HANGUP_SECONDS));
+  const [nextServerCommand, setNextServerCommand] = useState<ServerCallCommand | null>(null);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
 
-  const requestCallPermission = async (source: string): Promise<boolean> => {
-    if (Platform.OS !== "android") return true;
+  const updateUiFromStatus = (status: AutoAnswerStatus) => {
+    setUiState({
+      autoAnswerEnabled: status.enabled,
+      autoHangupSeconds: status.autoHangupSeconds,
+      hangupScheduled: status.hangupScheduled,
+      lastEvent: status.lastEvent,
+      lastEventAt: status.lastEventAt,
+    });
+    setAutoHangupSecondsText(String(status.autoHangupSeconds));
+  };
 
+  const refreshStatus = async () => {
     try {
-      const hasPermission = await PermissionsAndroid.check(
-        PermissionsAndroid.PERMISSIONS.CALL_PHONE
-      );
-      logEvent("runtime_permission_check", { source, hasPermission });
-
-      if (hasPermission) return true;
-
-      const result = await PermissionsAndroid.request(
-        PermissionsAndroid.PERMISSIONS.CALL_PHONE,
-        {
-          title: "Phone Call Permission",
-          message: "AutoCall needs permission to make phone calls",
-          buttonPositive: "OK",
-          buttonNegative: "Cancel",
-        }
-      );
-
-      const granted = result === PermissionsAndroid.RESULTS.GRANTED;
-      logEvent("runtime_permission_request_result", {
-        source,
-        result,
-        granted,
-      });
-      return granted;
+      const status = await getStatus();
+      updateUiFromStatus(status);
+      logEvent("status_refresh", status);
     } catch (error) {
-      logEvent("runtime_permission_error", { source, error });
-      return false;
+      logEvent("status_refresh_failed", { error });
+      setStatusMessage("Failed to load auto-answer status");
     }
   };
 
-  const getScheduledTime = (command: CallCommand) => {
-    if (!command.scheduledAt) return 0;
-    const time = new Date(command.scheduledAt).getTime();
-    return Number.isNaN(time) ? 0 : time;
+  const requestAndroidPermissions = async (): Promise<boolean> => {
+    if (Platform.OS !== "android") return true;
+
+    const permissions = [
+      PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+      PermissionsAndroid.PERMISSIONS.ANSWER_PHONE_CALLS,
+      PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
+    ];
+
+    for (const permission of permissions) {
+      const granted = await PermissionsAndroid.request(permission);
+      if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
+        setStatusMessage(`Permission denied: ${permission}`);
+        return false;
+      }
+    }
+
+    if (Platform.Version >= 33) {
+      await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+    }
+
+    return true;
   };
 
-  const formatCallTime = (scheduledAt?: string) => {
-    if (!scheduledAt) return "Now";
-    const time = new Date(scheduledAt);
-    if (Number.isNaN(time.getTime())) return "Now";
-    return time.toLocaleString();
-  };
-
-  const register = async () => {
-    logEvent("register_start", { deviceUid });
-    const response = await fetch(`${SERVER}/devices/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ deviceUid }),
-    });
-    logEvent("register_done", { status: response.status });
-  };
-
-  const heartbeat = async () => {
+  const registerDevice = async () => {
     try {
-      const response = await fetch(`${SERVER}/devices/heartbeat`, {
+      await fetch(`${SERVER}/devices/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceUid }),
+        body: JSON.stringify({ deviceUid: DEVICE_UID }),
       });
-      logEvent("heartbeat_done", { status: response.status });
     } catch (error) {
-      logEvent("heartbeat_error", { error });
+      logEvent("register_device_failed", { error });
+    }
+  };
+
+  const sendHeartbeat = async () => {
+    try {
+      await fetch(`${SERVER}/devices/heartbeat`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deviceUid: DEVICE_UID }),
+      });
+    } catch (error) {
+      logEvent("heartbeat_failed", { error });
     }
   };
 
   const updateCommandStatus = async (id: string, status: string) => {
     try {
-      const response = await fetch(`${SERVER}/commands/${id}/status`, {
+      await fetch(`${SERVER}/commands/${id}/status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ status }),
       });
-      logEvent("command_status_update", { id, status, http: response.status });
     } catch (error) {
-      logEvent("command_status_update_error", { id, status, error });
+      logEvent("update_command_status_failed", { id, status, error });
     }
   };
 
-  const getDirectCallModule = (): DirectCallNativeModule | null => {
-    const moduleCandidate = (NativeModules as { DirectCall?: unknown }).DirectCall;
-
-    if (!moduleCandidate) {
-      logEvent("native_module_missing", { hasDirectCall: false });
-      return null;
-    }
-
-    const directCall = moduleCandidate as Partial<DirectCallNativeModule>;
-    if (typeof directCall.call !== "function") {
-      logEvent("native_module_invalid_shape", { hasCallMethod: false });
-      return null;
-    }
-
-    return directCall as DirectCallNativeModule;
-  };
-
-  const executeDirectCall = async (
+  const executeOutgoingCall = async (
     rawPhoneNumber: string,
-    source: "server-command" | "manual-debug",
+    source: "server" | "manual",
     commandId?: string
   ): Promise<boolean> => {
-    logEvent("call_flow_entered", {
-      source,
-      commandId,
-      rawPhoneNumber,
-      appState: AppState.currentState,
-    });
-
-    const phoneNumber = normalizePhoneNumber(rawPhoneNumber);
-    if (!phoneNumber) {
-      logEvent("call_flow_invalid_number", { source, commandId, rawPhoneNumber });
+    const normalized = normalizePhoneNumber(rawPhoneNumber);
+    if (!normalized) {
+      setStatusMessage("Invalid phone number");
       if (commandId) {
         await updateCommandStatus(commandId, "failed");
       }
@@ -193,46 +189,33 @@ export default function Index() {
         await updateCommandStatus(commandId, "executing");
       }
 
-      const hasPermission = await requestCallPermission(source);
-      if (!hasPermission) {
-        logEvent("call_flow_permission_denied", { source, commandId, phoneNumber });
+      const hasPermissions = await requestAndroidPermissions();
+      if (!hasPermissions) {
         if (commandId) {
           await updateCommandStatus(commandId, "failed");
         }
         return false;
       }
 
-      const directCall = getDirectCallModule();
-      if (!directCall) {
-        if (commandId) {
-          await updateCommandStatus(commandId, "failed");
-        }
-        return false;
+      if (source === "server") {
+        logEvent("Outgoing call command received", { phoneNumber: normalized, commandId });
       }
 
-      logEvent("native_call_invocation_start", { source, commandId, phoneNumber });
-      const nativeResult = await directCall.call(phoneNumber);
-      logEvent("native_call_invocation_success", {
-        source,
-        commandId,
-        phoneNumber,
-        nativeResult,
-      });
+      await placeCall(normalized);
+      await refreshStatus();
 
       if (commandId) {
         await updateCommandStatus(commandId, "executed");
       }
+
+      setStatusMessage(source === "server" ? "Outgoing call started from server command" : "Outgoing call started");
       return true;
     } catch (error) {
-      logEvent("native_call_invocation_error", {
-        source,
-        commandId,
-        phoneNumber,
-        error,
-      });
+      logEvent("execute_outgoing_call_failed", { error, source, commandId, rawPhoneNumber });
       if (commandId) {
         await updateCommandStatus(commandId, "failed");
       }
+      setStatusMessage("Failed to start outgoing call");
       return false;
     } finally {
       if (commandId) {
@@ -241,136 +224,185 @@ export default function Index() {
     }
   };
 
-  const poll = async () => {
+  const getScheduledAtMs = (command: ServerCallCommand): number => {
+    if (!command.scheduledAt) return 0;
+    const dateValue = new Date(command.scheduledAt).getTime();
+    return Number.isNaN(dateValue) ? 0 : dateValue;
+  };
+
+  const pollCommands = async () => {
     try {
-      const response = await fetch(
-        `${SERVER}/commands?deviceUid=${deviceUid}&status=pending`
-      );
-      logEvent("poll_response", { status: response.status });
+      const response = await fetch(`${SERVER}/commands?deviceUid=${DEVICE_UID}&status=pending`);
+      if (!response.ok) return;
 
-      if (!response.ok) {
-        return;
+      const commands = (await response.json()) as ServerCallCommand[];
+      const dueCallCommands = commands
+        .filter((command) => command.type === "CALL")
+        .sort((a, b) => getScheduledAtMs(a) - getScheduledAtMs(b));
+
+      setNextServerCommand(dueCallCommands[0] ?? null);
+
+      for (const command of dueCallCommands) {
+        const dueNow = !command.scheduledAt || Date.now() >= getScheduledAtMs(command);
+        if (!dueNow) continue;
+        if (inFlightCommandIds.current.has(command.id)) continue;
+
+        await executeOutgoingCall(command.phoneNumber, "server", command.id);
       }
-
-      const data = (await response.json()) as CallCommand[];
-
-      const callCommands = data
-        .filter((cmd) => cmd.type === "CALL")
-        .sort((a, b) => getScheduledTime(a) - getScheduledTime(b));
-
-      if (callCommands.length === 0) {
-        setNextCall(null);
-        return;
-      }
-
-      setNextCall(callCommands[0]);
-      logEvent("server_command_received", {
-        count: callCommands.length,
-        nextCommand: callCommands[0],
-      });
-
-      callCommands.forEach((cmd) => {
-        const scheduledTime = getScheduledTime(cmd);
-        const shouldRunNow = !cmd.scheduledAt || Date.now() >= scheduledTime;
-
-        if (!shouldRunNow) return;
-        if (inFlightCommandIds.current.has(cmd.id)) {
-          logEvent("server_command_skipped_inflight", { commandId: cmd.id });
-          return;
-        }
-
-        void executeDirectCall(cmd.phoneNumber, "server-command", cmd.id);
-      });
     } catch (error) {
-      logEvent("poll_error", { error });
+      logEvent("poll_commands_failed", { error });
+    }
+  };
+
+  const onToggleAutoAnswer = async (enabled: boolean) => {
+    try {
+      const hasPermissions = await requestAndroidPermissions();
+      if (!hasPermissions) return;
+
+      if (enabled) {
+        const parsed = Number.parseInt(autoHangupSecondsText, 10);
+        const seconds = Number.isNaN(parsed) ? DEFAULT_HANGUP_SECONDS : parsed;
+        const status = await enableAutoAnswer(seconds);
+        updateUiFromStatus(status);
+        setStatusMessage(`Auto Answer ON (${status.autoHangupSeconds}s)`);
+      } else {
+        const status = await disableAutoAnswer();
+        updateUiFromStatus(status);
+        setStatusMessage("Auto Answer OFF");
+      }
+    } catch (error) {
+      logEvent("toggle_auto_answer_failed", { error, enabled });
+      setStatusMessage("Failed to change auto-answer mode");
+    }
+  };
+
+  const onApplyHangupSeconds = async () => {
+    if (!uiState.autoAnswerEnabled) {
+      setStatusMessage("Turn on Auto Answer first");
+      return;
+    }
+
+    const parsed = Number.parseInt(autoHangupSecondsText, 10);
+    const seconds = Number.isNaN(parsed) ? DEFAULT_HANGUP_SECONDS : parsed;
+
+    try {
+      const status = await enableAutoAnswer(seconds);
+      updateUiFromStatus(status);
+      setStatusMessage(`Auto hangup set to ${status.autoHangupSeconds}s`);
+    } catch (error) {
+      logEvent("apply_hangup_seconds_failed", { error, seconds });
+      setStatusMessage("Failed to update hangup seconds");
+    }
+  };
+
+  const onCallNow = async () => {
+    await executeOutgoingCall(phoneNumber, "manual");
+  };
+
+  const onEndCurrentCall = async () => {
+    try {
+      const result = await endCurrentCall();
+      await refreshStatus();
+      setStatusMessage(result.ended ? "Current call ended" : "Could not end current call");
+    } catch (error) {
+      logEvent("end_current_call_failed", { error });
+      setStatusMessage("Failed to end current call");
     }
   };
 
   useEffect(() => {
-    let hb: ReturnType<typeof setInterval>;
-    let pl: ReturnType<typeof setInterval>;
+    let heartbeatTimer: ReturnType<typeof setInterval>;
+    let pollTimer: ReturnType<typeof setInterval>;
+    let statusTimer: ReturnType<typeof setInterval>;
 
     const init = async () => {
-      logEvent("app_init_start");
-      await requestCallPermission("startup");
+      await requestAndroidPermissions();
+      await refreshStatus();
+      await registerDevice();
+      await pollCommands();
 
-      try {
-        await register();
-      } catch (error) {
-        logEvent("register_error", { error });
-      }
+      heartbeatTimer = setInterval(() => {
+        void sendHeartbeat();
+      }, POLL_INTERVAL_MS);
 
-      await poll();
+      pollTimer = setInterval(() => {
+        void pollCommands();
+      }, POLL_INTERVAL_MS);
 
-      hb = setInterval(() => {
-        void heartbeat();
-      }, 10000);
-      pl = setInterval(() => {
-        void poll();
-      }, 10000);
-
-      logEvent("app_init_done");
+      statusTimer = setInterval(() => {
+        void refreshStatus();
+      }, 3000);
     };
 
     void init();
 
     return () => {
-      logEvent("app_cleanup");
-      if (hb) clearInterval(hb);
-      if (pl) clearInterval(pl);
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      if (pollTimer) clearInterval(pollTimer);
+      if (statusTimer) clearInterval(statusTimer);
     };
-    // Intentional one-time startup flow for device registration/poll timers.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <View style={styles.screen}>
-      <View style={styles.bgShapeOne} />
-      <View style={styles.bgShapeTwo} />
+      <View style={styles.card}>
+        <Text style={styles.title}>AutoCall</Text>
+        <Text style={styles.subtitle}>Personal Android Call Control</Text>
 
-      <View style={styles.glassCard}>
-        <View style={styles.statusRow}>
-          <View style={styles.dot} />
-          <Text style={styles.statusLabel}>AutoCall Running</Text>
+        <View style={styles.section}>
+          <View style={styles.rowBetween}>
+            <Text style={styles.label}>Auto Answer</Text>
+            <Switch value={uiState.autoAnswerEnabled} onValueChange={onToggleAutoAnswer} />
+          </View>
+
+          <Text style={styles.label}>Auto Hangup Seconds</Text>
+          <View style={styles.row}>
+            <TextInput
+              value={autoHangupSecondsText}
+              onChangeText={setAutoHangupSecondsText}
+              keyboardType="number-pad"
+              style={[styles.input, styles.secondsInput]}
+              placeholder="20"
+              placeholderTextColor="#8ca0bf"
+            />
+            <Pressable style={styles.secondaryButton} onPress={onApplyHangupSeconds}>
+              <Text style={styles.secondaryButtonText}>Apply</Text>
+            </Pressable>
+          </View>
         </View>
 
-        <Text style={styles.title}>Direct Call Agent</Text>
-        <Text style={styles.subtitle}>
-          Device is connected and waiting for pending call commands.
-        </Text>
-
-        <View style={styles.metaBox}>
-          <Text style={styles.metaLabel}>Device UID</Text>
-          <Text style={styles.metaValue}>{deviceUid}</Text>
-        </View>
-
-        <View style={styles.nextCallBox}>
-          <Text style={styles.nextCallTitle}>Next Call</Text>
-          <Text style={styles.nextCallNumber}>
-            {nextCall?.phoneNumber ?? "No pending calls"}
-          </Text>
-          <Text style={styles.nextCallTime}>
-            {nextCall ? formatCallTime(nextCall.scheduledAt) : "Now"}
-          </Text>
-        </View>
-
-        <View style={styles.testBox}>
-          <Text style={styles.nextCallTitle}>Manual Foreground Test</Text>
+        <View style={styles.section}>
+          <Text style={styles.label}>Phone Number</Text>
           <TextInput
-            value={testPhoneNumber}
-            onChangeText={setTestPhoneNumber}
-            placeholder="+15555550123"
-            placeholderTextColor="rgba(215, 229, 252, 0.58)"
+            value={phoneNumber}
+            onChangeText={setPhoneNumber}
             keyboardType="phone-pad"
             style={styles.input}
+            placeholder="05xxxxxxxx"
+            placeholderTextColor="#8ca0bf"
           />
-          <Pressable
-            style={styles.callButton}
-            onPress={() => {
-              void executeDirectCall(testPhoneNumber, "manual-debug");
-            }}>
-            <Text style={styles.callButtonText}>Trigger Direct Call</Text>
-          </Pressable>
+
+          <View style={styles.row}>
+            <Pressable style={styles.primaryButton} onPress={onCallNow}>
+              <Text style={styles.primaryButtonText}>اتصال الآن</Text>
+            </Pressable>
+            <Pressable style={styles.dangerButton} onPress={onEndCurrentCall}>
+              <Text style={styles.dangerButtonText}>End Current Call</Text>
+            </Pressable>
+          </View>
+        </View>
+
+        <View style={styles.statusBox}>
+          <Text style={styles.statusLine}>Auto Answer: {uiState.autoAnswerEnabled ? "ON" : "OFF"}</Text>
+          <Text style={styles.statusLine}>Auto Hangup: {uiState.autoHangupSeconds}s</Text>
+          <Text style={styles.statusLine}>Hangup Timer: {uiState.hangupScheduled ? "Scheduled" : "Idle"}</Text>
+          <Text style={styles.statusLine}>Last Event: {uiState.lastEvent || "--"}</Text>
+          <Text style={styles.statusLine}>Event Time: {formatTime(uiState.lastEventAt)}</Text>
+          <Text style={styles.statusLine}>
+            Next Server Call: {nextServerCommand?.phoneNumber ?? "No pending calls"}
+          </Text>
+          <Text style={styles.statusMessage}>{statusMessage}</Text>
         </View>
       </View>
     </View>
@@ -380,154 +412,120 @@ export default function Index() {
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: "#0d1324",
+    backgroundColor: "#0f1627",
     justifyContent: "center",
     alignItems: "center",
-    padding: 20,
-    overflow: "hidden",
+    padding: 16,
   },
-  bgShapeOne: {
-    position: "absolute",
-    width: 240,
-    height: 240,
-    borderRadius: 999,
-    backgroundColor: "rgba(82, 159, 255, 0.24)",
-    top: 90,
-    left: -40,
-  },
-  bgShapeTwo: {
-    position: "absolute",
-    width: 260,
-    height: 260,
-    borderRadius: 999,
-    backgroundColor: "rgba(56, 231, 201, 0.20)",
-    bottom: 70,
-    right: -60,
-  },
-  glassCard: {
+  card: {
     width: "100%",
-    maxWidth: 430,
-    borderRadius: 24,
+    maxWidth: 460,
+    backgroundColor: "#1b2740",
+    borderRadius: 16,
+    padding: 16,
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.28)",
-    backgroundColor: "rgba(255, 255, 255, 0.09)",
-    padding: 22,
-    shadowColor: "#000",
-    shadowOpacity: 0.26,
-    shadowRadius: 24,
-    shadowOffset: { width: 0, height: 14 },
-    elevation: 10,
-  },
-  statusRow: {
-    flexDirection: "row",
-    alignItems: "center",
-    marginBottom: 14,
-  },
-  dot: {
-    width: 10,
-    height: 10,
-    borderRadius: 999,
-    backgroundColor: "#35e3c5",
-    marginRight: 8,
-  },
-  statusLabel: {
-    fontSize: 13,
-    fontWeight: "700",
-    color: "#d8fff8",
-    letterSpacing: 0.5,
-    textTransform: "uppercase",
+    borderColor: "#324869",
   },
   title: {
+    fontSize: 26,
+    fontWeight: "700",
     color: "#ffffff",
-    fontSize: 28,
-    fontWeight: "800",
-    marginBottom: 8,
   },
   subtitle: {
-    color: "rgba(233, 241, 255, 0.9)",
-    fontSize: 15,
-    lineHeight: 23,
-    marginBottom: 18,
-  },
-  metaBox: {
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.24)",
-    backgroundColor: "rgba(7, 16, 36, 0.35)",
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-  },
-  metaLabel: {
-    color: "rgba(207, 222, 252, 0.86)",
-    fontSize: 12,
-    marginBottom: 4,
-    letterSpacing: 0.4,
-    textTransform: "uppercase",
-  },
-  metaValue: {
-    color: "#ffffff",
-    fontSize: 16,
-    fontWeight: "600",
-  },
-  nextCallBox: {
-    marginTop: 14,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.2)",
-    backgroundColor: "rgba(255, 255, 255, 0.06)",
-    paddingVertical: 12,
-    paddingHorizontal: 14,
-  },
-  nextCallTitle: {
-    color: "rgba(207, 222, 252, 0.9)",
-    fontSize: 12,
-    marginBottom: 6,
-    letterSpacing: 0.4,
-    textTransform: "uppercase",
-  },
-  nextCallNumber: {
-    color: "#ffffff",
-    fontSize: 20,
-    fontWeight: "700",
-    marginBottom: 4,
-  },
-  nextCallTime: {
-    color: "rgba(233, 241, 255, 0.9)",
+    marginTop: 4,
+    marginBottom: 12,
     fontSize: 14,
-    fontWeight: "500",
+    color: "#b8c7de",
   },
-  testBox: {
-    marginTop: 14,
-    borderRadius: 14,
+  section: {
+    marginTop: 10,
+    padding: 12,
+    borderRadius: 12,
+    backgroundColor: "#152037",
     borderWidth: 1,
-    borderColor: "rgba(95, 246, 202, 0.35)",
-    backgroundColor: "rgba(7, 16, 36, 0.42)",
-    paddingVertical: 12,
-    paddingHorizontal: 14,
+    borderColor: "#273a58",
+  },
+  rowBetween: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: 8,
+  },
+  row: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
+    marginTop: 8,
+  },
+  label: {
+    fontSize: 14,
+    fontWeight: "600",
+    color: "#dde7f8",
   },
   input: {
-    marginTop: 6,
+    flex: 1,
     borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.26)",
+    borderColor: "#34507a",
     borderRadius: 10,
-    backgroundColor: "rgba(255, 255, 255, 0.08)",
+    paddingHorizontal: 10,
+    paddingVertical: 9,
     color: "#ffffff",
-    paddingHorizontal: 12,
-    paddingVertical: 10,
-    fontSize: 16,
-    fontWeight: "600",
+    backgroundColor: "#101a2d",
   },
-  callButton: {
-    marginTop: 10,
+  secondsInput: {
+    maxWidth: 120,
+  },
+  primaryButton: {
+    flex: 1,
     borderRadius: 10,
-    backgroundColor: "#3ee5c8",
-    paddingVertical: 11,
+    backgroundColor: "#27c596",
+    paddingVertical: 10,
     alignItems: "center",
   },
-  callButtonText: {
-    color: "#06211d",
-    fontSize: 15,
-    fontWeight: "800",
-    letterSpacing: 0.25,
+  primaryButtonText: {
+    color: "#062019",
+    fontWeight: "700",
+  },
+  secondaryButton: {
+    borderRadius: 10,
+    backgroundColor: "#89a7ff",
+    paddingVertical: 10,
+    paddingHorizontal: 14,
+    alignItems: "center",
+  },
+  secondaryButtonText: {
+    color: "#101d3a",
+    fontWeight: "700",
+  },
+  dangerButton: {
+    flex: 1,
+    borderRadius: 10,
+    backgroundColor: "#e25f7c",
+    paddingVertical: 10,
+    alignItems: "center",
+  },
+  dangerButtonText: {
+    color: "#2b0814",
+    fontWeight: "700",
+  },
+  statusBox: {
+    marginTop: 12,
+    borderRadius: 12,
+    backgroundColor: "#101b2f",
+    borderWidth: 1,
+    borderColor: "#273a58",
+    padding: 12,
+  },
+  statusLine: {
+    color: "#e6efff",
+    fontSize: 13,
+    marginBottom: 4,
+  },
+  statusMessage: {
+    color: "#7fe3ca",
+    fontSize: 13,
+    marginTop: 8,
+    fontWeight: "600",
   },
 });
+
