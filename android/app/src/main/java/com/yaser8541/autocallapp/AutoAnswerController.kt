@@ -22,13 +22,29 @@ object AutoAnswerController {
     @Volatile
     private var answeredCurrentRinging = false
 
+    @Volatile
+    private var isPlacingOutgoingCall = false
+
+    fun onOutgoingCallStarted(context: Context) {
+        val appContext = context.applicationContext
+        isPlacingOutgoingCall = true
+        answeredCurrentRinging = false
+        cancelScheduledHangup(appContext, "Auto-answer timer skipped due to outgoing call")
+        Log.i(TAG, "Outgoing call detected -> auto-answer ignored")
+    }
+
     fun onPhoneStateChanged(context: Context, state: String?) {
         val appContext = context.applicationContext
         val phoneState = state ?: return
 
         when (phoneState) {
             TelephonyManager.EXTRA_STATE_RINGING -> {
-                Log.i(TAG, "Incoming call ringing")
+                if (isPlacingOutgoingCall) {
+                    Log.i(TAG, "Auto-answer timer skipped due to outgoing call")
+                    return
+                }
+
+                Log.i(TAG, "Incoming call detected -> auto-answer enabled")
                 AutoAnswerStore.setLastEvent(appContext, "Incoming call detected")
 
                 if (!AutoAnswerStore.isEnabled(appContext)) {
@@ -49,15 +65,17 @@ object AutoAnswerController {
             }
 
             TelephonyManager.EXTRA_STATE_OFFHOOK -> {
-                Log.i(TAG, "Call is off-hook")
-                if (AutoAnswerStore.isEnabled(appContext)) {
-                    scheduleAutoHangup(appContext)
+                if (isPlacingOutgoingCall) {
+                    Log.i(TAG, "Outgoing call detected -> auto-answer ignored")
+                } else {
+                    Log.i(TAG, "Call is off-hook")
                 }
             }
 
             TelephonyManager.EXTRA_STATE_IDLE -> {
                 Log.i(TAG, "Phone state idle")
                 answeredCurrentRinging = false
+                isPlacingOutgoingCall = false
                 cancelScheduledHangup(appContext, "Call idle - timer cleared")
             }
         }
@@ -66,6 +84,7 @@ object AutoAnswerController {
     fun onAutoAnswerDisabled(context: Context) {
         val appContext = context.applicationContext
         answeredCurrentRinging = false
+        isPlacingOutgoingCall = false
         cancelScheduledHangup(appContext, "Auto answer disabled")
     }
 
@@ -91,6 +110,7 @@ object AutoAnswerController {
             val ended = telecomManager.endCall()
             if (ended) {
                 Log.i(TAG, "Ending current call")
+                isPlacingOutgoingCall = false
                 AutoAnswerStore.setLastEvent(appContext, reason)
             } else {
                 Log.w(TAG, "TelecomManager.endCall returned false")
@@ -143,6 +163,10 @@ object AutoAnswerController {
     private fun scheduleAutoHangup(context: Context) {
         val seconds = AutoAnswerStore.getAutoHangupSeconds(context)
         synchronized(lock) {
+            if (isPlacingOutgoingCall) {
+                Log.i(TAG, "Auto-answer timer skipped due to outgoing call")
+                return
+            }
             if (pendingHangupRunnable != null) {
                 return
             }
@@ -155,7 +179,7 @@ object AutoAnswerController {
             }
 
             pendingHangupRunnable = runnable
-            Log.i(TAG, "Scheduling auto hangup in ${seconds}s")
+            Log.i(TAG, "Auto-answer timer started")
             AutoAnswerStore.setLastEvent(context, "Scheduling auto hangup in ${seconds}s")
             mainHandler.postDelayed(runnable, seconds * 1000L)
         }

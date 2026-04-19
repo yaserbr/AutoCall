@@ -28,6 +28,7 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
                     rawNumber = phoneNumber,
                     activity = reactContext.currentActivity
                 )
+                AutoAnswerController.onOutgoingCallStarted(reactContext)
 
                 AutoAnswerStore.setLastEvent(reactContext, "Outgoing call started")
                 Log.i(TAG, "Outgoing call started")
@@ -62,6 +63,9 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
                     autoEndMs = autoEndMs,
                     activity = reactContext.currentActivity
                 )
+                if (result.success) {
+                    AutoAnswerController.onOutgoingCallStarted(reactContext)
+                }
 
                 val map = Arguments.createMap().apply {
                     putBoolean("success", result.success)
