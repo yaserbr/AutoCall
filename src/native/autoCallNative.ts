@@ -21,12 +21,14 @@ type SimpleCallResult = {
   message: string;
   phoneNumber: string | null;
   autoEndMs: number | null;
+  durationSeconds?: number | null;
   timestamp: number;
 };
 
 type AutoCallNativeModule = {
   startOutgoingCall(phoneNumber: string): Promise<OutgoingCallResult>;
   startSimpleCall(phoneNumber: string, autoEndMs: number | null): Promise<SimpleCallResult>;
+  startServerCommandCall(phoneNumber: string, durationSeconds: number | null): Promise<SimpleCallResult>;
   enableAutoAnswer(config: { autoHangupSeconds: number }): Promise<AutoAnswerStatus>;
   disableAutoAnswer(): Promise<AutoAnswerStatus>;
   getAutoAnswerStatus(): Promise<AutoAnswerStatus>;
@@ -45,6 +47,9 @@ export const placeCall = (phoneNumber: string) => getNativeModule().startOutgoin
 
 export const startSimpleCall = (phoneNumber: string, autoEndMs?: number | null) =>
   getNativeModule().startSimpleCall(phoneNumber, autoEndMs ?? null);
+
+export const startServerCommandCall = (phoneNumber: string, durationSeconds?: number | null) =>
+  getNativeModule().startServerCommandCall(phoneNumber, durationSeconds ?? null);
 
 export const enableAutoAnswer = (autoHangupSeconds: number) =>
   getNativeModule().enableAutoAnswer({ autoHangupSeconds });

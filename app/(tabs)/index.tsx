@@ -16,6 +16,7 @@ import {
   endCurrentCall,
   getStatus,
   startSimpleCall,
+  startServerCommandCall,
 } from "../../src/native/autoCallNative";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
@@ -25,6 +26,7 @@ const DEFAULT_PHONE = "05";
 const DEFAULT_HANGUP_SECONDS = 20;
 const DEFAULT_SIMPLE_CALL_DURATION_SECONDS = 20;
 const MAX_SIMPLE_CALL_DURATION_SECONDS = 3600;
+const RIYADH_UTC_OFFSET_MS = 3 * 60 * 60 * 1000;
 const LOG_PREFIX = "[AutoCall/UI]";
 
 type ServerCallCommand = {
@@ -83,6 +85,90 @@ const formatTime = (timestamp: number): string => {
   return new Date(timestamp).toLocaleString();
 };
 
+const parseScheduledAtMs = (scheduledAt?: string | null): number | null => {
+  if (!scheduledAt) {
+    return null;
+  }
+
+  const trimmed = scheduledAt.trim();
+  if (!trimmed) {
+    return null;
+  }
+
+  if (/^\d+$/.test(trimmed)) {
+    const numeric = Number.parseInt(trimmed, 10);
+    if (!Number.isNaN(numeric)) {
+      return trimmed.length >= 13 ? numeric : numeric * 1000;
+    }
+  }
+
+  const parsedWithNativeDate = Date.parse(trimmed);
+  if (!Number.isNaN(parsedWithNativeDate)) {
+    return parsedWithNativeDate;
+  }
+
+  // Server may return display-formatted values like "20/04/2026, 19:45:00" (Asia/Riyadh).
+  const normalizedForRegex = trimmed.replace(",", "");
+  const match = normalizedForRegex.match(
+    /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/
+  );
+  if (!match) {
+    return null;
+  }
+
+  const [, dayPart, monthPart, yearPart, hourPart, minutePart, secondPart = "0"] = match;
+  const day = Number.parseInt(dayPart, 10);
+  const month = Number.parseInt(monthPart, 10);
+  const year = Number.parseInt(yearPart, 10);
+  const hour = Number.parseInt(hourPart, 10);
+  const minute = Number.parseInt(minutePart, 10);
+  const second = Number.parseInt(secondPart, 10);
+
+  if (
+    Number.isNaN(day) ||
+    Number.isNaN(month) ||
+    Number.isNaN(year) ||
+    Number.isNaN(hour) ||
+    Number.isNaN(minute) ||
+    Number.isNaN(second)
+  ) {
+    return null;
+  }
+
+  if (
+    year < 1970 ||
+    month < 1 ||
+    month > 12 ||
+    day < 1 ||
+    day > 31 ||
+    hour < 0 ||
+    hour > 23 ||
+    minute < 0 ||
+    minute > 59 ||
+    second < 0 ||
+    second > 59
+  ) {
+    return null;
+  }
+
+  const utcMs = Date.UTC(year, month - 1, day, hour, minute, second) - RIYADH_UTC_OFFSET_MS;
+
+  // Validate date rollover (e.g. 31/02) before accepting the parsed value.
+  const validation = new Date(utcMs + RIYADH_UTC_OFFSET_MS);
+  if (
+    validation.getUTCFullYear() !== year ||
+    validation.getUTCMonth() !== month - 1 ||
+    validation.getUTCDate() !== day ||
+    validation.getUTCHours() !== hour ||
+    validation.getUTCMinutes() !== minute ||
+    validation.getUTCSeconds() !== second
+  ) {
+    return null;
+  }
+
+  return utcMs;
+};
+
 export default function AutoCallScreen() {
   const [uiState, setUiState] = useState<UiState>(emptyState);
   const [statusMessage, setStatusMessage] = useState("Ready");
@@ -93,6 +179,7 @@ export default function AutoCallScreen() {
   );
   const [nextServerCommand, setNextServerCommand] = useState<ServerCallCommand | null>(null);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
+  const executedCommandIds = useRef<Set<string>>(new Set());
 
   const updateUiFromStatus = (status: AutoAnswerStatus) => {
     setUiState({
@@ -191,13 +278,13 @@ export default function AutoCallScreen() {
     return clamped * 1000;
   };
 
-  const parseServerCommandDurationMs = (durationSeconds?: number | null): number | null => {
+  const parseServerCommandDurationSeconds = (durationSeconds?: number | null): number | null => {
     if (typeof durationSeconds !== "number" || !Number.isFinite(durationSeconds) || durationSeconds <= 0) {
       return null;
     }
 
     const clamped = Math.min(durationSeconds, MAX_SIMPLE_CALL_DURATION_SECONDS);
-    return Math.round(clamped * 1000);
+    return Math.round(clamped);
   };
 
   const executeOutgoingCall = async (
@@ -237,11 +324,13 @@ export default function AutoCallScreen() {
         });
       }
 
-      const autoEndMs =
+      const callResult =
         source === "server"
-          ? parseServerCommandDurationMs(commandDurationSeconds)
-          : parseSimpleCallDurationMs();
-      const callResult = await startSimpleCall(normalized, autoEndMs);
+          ? await startServerCommandCall(
+              normalized,
+              parseServerCommandDurationSeconds(commandDurationSeconds)
+            )
+          : await startSimpleCall(normalized, parseSimpleCallDurationMs());
       if (!callResult.success) {
         setStatusMessage(`Call rejected: ${callResult.message}`);
         if (commandId) {
@@ -298,10 +387,28 @@ export default function AutoCallScreen() {
     }
   };
 
-  const getScheduledAtMs = (command: ServerCallCommand): number => {
-    if (!command.scheduledAt) return 0;
-    const dateValue = new Date(command.scheduledAt).getTime();
-    return Number.isNaN(dateValue) ? 0 : dateValue;
+  const getScheduledAtMs = (command: ServerCallCommand): number | null => {
+    return parseScheduledAtMs(command.scheduledAt ?? null);
+  };
+
+  const getCommandSortKey = (command: ServerCallCommand): number => {
+    const scheduledAtMs = getScheduledAtMs(command);
+    return scheduledAtMs ?? 0;
+  };
+
+  const isCommandDueNow = (command: ServerCallCommand, nowMs: number): boolean => {
+    if (!command.scheduledAt) {
+      return true;
+    }
+    const scheduledAtMs = getScheduledAtMs(command);
+    if (scheduledAtMs === null) {
+      logEvent("Unparseable scheduledAt; executing immediately to avoid stuck command", {
+        commandId: command.id,
+        scheduledAt: command.scheduledAt,
+      });
+      return true;
+    }
+    return nowMs >= scheduledAtMs;
   };
 
   const pollCommands = async () => {
@@ -310,21 +417,38 @@ export default function AutoCallScreen() {
       if (!response.ok) return;
 
       const commands = (await response.json()) as ServerCallCommand[];
-      const dueCommands = [...commands].sort((a, b) => getScheduledAtMs(a) - getScheduledAtMs(b));
+      const dueCommands = [...commands].sort((a, b) => getCommandSortKey(a) - getCommandSortKey(b));
 
       setNextServerCommand(dueCommands.find((command) => command.type === "CALL") ?? null);
 
       for (const command of dueCommands) {
-        const dueNow = !command.scheduledAt || Date.now() >= getScheduledAtMs(command);
-        if (!dueNow) continue;
+        if (executedCommandIds.current.has(command.id)) {
+          logEvent("Already executed, skipping", { commandId: command.id });
+          continue;
+        }
         if (inFlightCommandIds.current.has(command.id)) continue;
+        if (!isCommandDueNow(command, Date.now())) {
+          logEvent("Skipping scheduled command (not yet time)", {
+            commandId: command.id,
+            scheduledAt: command.scheduledAt ?? null,
+          });
+          continue;
+        }
 
         const action =
           command.action ??
           (command.type === "END" ? "end" : "call");
+        logEvent("Executing scheduled command", {
+          commandId: command.id,
+          action,
+          scheduledAt: command.scheduledAt ?? null,
+        });
 
         if (action === "end") {
-          await executeEndCommand(command.id);
+          const ended = await executeEndCommand(command.id);
+          if (ended) {
+            executedCommandIds.current.add(command.id);
+          }
           continue;
         }
 
@@ -333,12 +457,15 @@ export default function AutoCallScreen() {
           continue;
         }
 
-        await executeOutgoingCall(
+        const callStarted = await executeOutgoingCall(
           command.phoneNumber,
           "server",
           command.id,
           command.durationSeconds ?? null
         );
+        if (callStarted) {
+          executedCommandIds.current.add(command.id);
+        }
       }
     } catch (error) {
       logEvent("poll_commands_failed", { error });

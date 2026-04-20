@@ -12,6 +12,7 @@ import androidx.core.content.ContextCompat
 
 object AutoAnswerController {
     private const val TAG = "AutoCall/AutoAnswer"
+    private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
 
     private val mainHandler = Handler(Looper.getMainLooper())
     private val lock = Any()
@@ -25,11 +26,33 @@ object AutoAnswerController {
     @Volatile
     private var isPlacingOutgoingCall = false
 
+    @Volatile
+    private var pendingOutgoingServerHangupSeconds: Int? = null
+
+    @Volatile
+    private var outgoingServerHangupScheduled = false
+
     fun onOutgoingCallStarted(context: Context) {
+        onOutgoingCallStarted(context, null)
+    }
+
+    fun onServerOutgoingCallStarted(context: Context, durationSeconds: Int?) {
+        onOutgoingCallStarted(context, normalizeServerDurationSeconds(durationSeconds))
+    }
+
+    private fun onOutgoingCallStarted(context: Context, serverDurationSeconds: Int?) {
         val appContext = context.applicationContext
         isPlacingOutgoingCall = true
         answeredCurrentRinging = false
+        pendingOutgoingServerHangupSeconds = serverDurationSeconds
+        outgoingServerHangupScheduled = false
         cancelScheduledHangup(appContext, "Auto-answer timer skipped due to outgoing call")
+        if (serverDurationSeconds != null) {
+            Log.i(
+                TAG,
+                "Server call duration will start after answered seconds=$serverDurationSeconds"
+            )
+        }
         Log.i(TAG, "Outgoing call detected -> auto-answer ignored")
     }
 
@@ -67,6 +90,7 @@ object AutoAnswerController {
             TelephonyManager.EXTRA_STATE_OFFHOOK -> {
                 if (isPlacingOutgoingCall) {
                     Log.i(TAG, "Outgoing call detected -> auto-answer ignored")
+                    scheduleOutgoingServerHangupAfterAnsweredIfNeeded(appContext)
                 } else {
                     Log.i(TAG, "Call is off-hook")
                 }
@@ -76,6 +100,8 @@ object AutoAnswerController {
                 Log.i(TAG, "Phone state idle")
                 answeredCurrentRinging = false
                 isPlacingOutgoingCall = false
+                pendingOutgoingServerHangupSeconds = null
+                outgoingServerHangupScheduled = false
                 cancelScheduledHangup(appContext, "Call idle - timer cleared")
             }
         }
@@ -185,6 +211,33 @@ object AutoAnswerController {
         }
     }
 
+    private fun scheduleOutgoingServerHangupAfterAnsweredIfNeeded(context: Context) {
+        val seconds = pendingOutgoingServerHangupSeconds ?: return
+        synchronized(lock) {
+            if (outgoingServerHangupScheduled) {
+                return
+            }
+            if (pendingHangupRunnable != null) {
+                return
+            }
+
+            val runnable = Runnable {
+                synchronized(lock) {
+                    pendingHangupRunnable = null
+                    outgoingServerHangupScheduled = false
+                }
+                endCurrentCall(context, "Call ended after ${seconds}s")
+            }
+
+            pendingHangupRunnable = runnable
+            outgoingServerHangupScheduled = true
+            pendingOutgoingServerHangupSeconds = null
+            Log.i(TAG, "Server outgoing duration timer started after answered in ${seconds}s")
+            AutoAnswerStore.setLastEvent(context, "Scheduling outgoing call end in ${seconds}s")
+            mainHandler.postDelayed(runnable, seconds * 1000L)
+        }
+    }
+
     private fun cancelScheduledHangup(context: Context, reason: String) {
         synchronized(lock) {
             val runnable = pendingHangupRunnable ?: return
@@ -199,6 +252,13 @@ object AutoAnswerController {
             context,
             Manifest.permission.ANSWER_PHONE_CALLS
         ) == PackageManager.PERMISSION_GRANTED
+    }
+
+    private fun normalizeServerDurationSeconds(durationSeconds: Int?): Int? {
+        if (durationSeconds == null || durationSeconds <= 0) {
+            return null
+        }
+        return durationSeconds.coerceAtMost(MAX_SERVER_CALL_DURATION_SECONDS)
     }
 }
 

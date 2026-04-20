@@ -14,6 +14,7 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
 
     companion object {
         private const val TAG = "AutoCall/NativeModule"
+        private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
     }
 
     override fun getName() = "AutoCallNative"
@@ -100,6 +101,65 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun startServerCommandCall(phoneNumber: String, durationSeconds: Double?, promise: Promise) {
+        Log.i(
+            TAG,
+            "Server command call received phone=$phoneNumber durationSeconds=$durationSeconds"
+        )
+        UiThreadUtil.runOnUiThread {
+            try {
+                val normalizedDurationSeconds = normalizeServerDurationSeconds(durationSeconds)
+                val result = SimpleCallManager.startSimpleCall(
+                    context = reactContext,
+                    rawPhoneNumber = phoneNumber,
+                    autoEndMs = null,
+                    activity = reactContext.currentActivity
+                )
+                if (result.success) {
+                    AutoAnswerController.onServerOutgoingCallStarted(
+                        reactContext,
+                        normalizedDurationSeconds
+                    )
+                }
+
+                val map = Arguments.createMap().apply {
+                    putBoolean("success", result.success)
+                    putString("reason", result.reason)
+                    putString("message", result.message)
+                    if (result.phoneNumber != null) {
+                        putString("phoneNumber", result.phoneNumber)
+                    } else {
+                        putNull("phoneNumber")
+                    }
+                    putNull("autoEndMs")
+                    if (normalizedDurationSeconds != null) {
+                        putDouble("durationSeconds", normalizedDurationSeconds.toDouble())
+                    } else {
+                        putNull("durationSeconds")
+                    }
+                    putDouble("timestamp", result.timestamp.toDouble())
+                }
+                promise.resolve(map)
+            } catch (error: Throwable) {
+                Log.e(TAG, "startServerCommandCall failed", error)
+                val map = Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putString("reason", "start_server_command_call_failed")
+                    putString(
+                        "message",
+                        error.message ?: "Unexpected error while starting server command call"
+                    )
+                    putNull("phoneNumber")
+                    putNull("autoEndMs")
+                    putNull("durationSeconds")
+                    putDouble("timestamp", System.currentTimeMillis().toDouble())
+                }
+                promise.resolve(map)
+            }
+        }
+    }
+
+    @ReactMethod
     fun enableAutoAnswer(config: ReadableMap?, promise: Promise) {
         try {
             val requestedSeconds = if (
@@ -178,5 +238,16 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         putBoolean("hangupScheduled", AutoAnswerController.isHangupScheduled())
         putString("lastEvent", snapshot.lastEvent)
         putDouble("lastEventAt", snapshot.lastEventAt.toDouble())
+    }
+
+    private fun normalizeServerDurationSeconds(durationSeconds: Double?): Int? {
+        if (durationSeconds == null || durationSeconds.isNaN() || durationSeconds <= 0.0) {
+            return null
+        }
+        val normalized = durationSeconds.toInt()
+        if (normalized <= 0) {
+            return null
+        }
+        return normalized.coerceAtMost(MAX_SERVER_CALL_DURATION_SECONDS)
     }
 }
