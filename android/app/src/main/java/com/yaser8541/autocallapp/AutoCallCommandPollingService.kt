@@ -30,7 +30,6 @@ class AutoCallCommandPollingService : Service() {
     companion object {
         private const val TAG = "AutoCall/CommandService"
         private const val SERVER = "https://serverautocall-production.up.railway.app"
-        private const val DEVICE_UID = "device_123"
         private const val POLL_INTERVAL_MS = 10_000L
         private const val MAX_AUTO_HANGUP_SECONDS = 600
         private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
@@ -204,36 +203,48 @@ class AutoCallCommandPollingService : Service() {
             return
         }
 
+        val deviceUid = currentDeviceUid()
         val payload = JSONObject().apply {
-            put("deviceUid", DEVICE_UID)
+            put("deviceUid", deviceUid)
         }
         val result = postJson("$SERVER/devices/register", payload)
         if (result.isSuccessCode()) {
             hasRegisteredDevice = true
-            Log.i(TAG, "background/runtime register device success")
+            syncDeviceIdentityFromServerResponse(result.body)
+            Log.i(TAG, "background/runtime register device success uid=$deviceUid")
         } else {
-            Log.w(TAG, "background/runtime register device failed code=${result.code}")
+            Log.w(
+                TAG,
+                "background/runtime register device failed uid=$deviceUid code=${result.code}"
+            )
         }
     }
 
     private fun sendHeartbeat() {
+        val deviceUid = currentDeviceUid()
         val payload = JSONObject().apply {
-            put("deviceUid", DEVICE_UID)
+            put("deviceUid", deviceUid)
         }
         val result = postJson("$SERVER/devices/heartbeat", payload)
-        if (!result.isSuccessCode()) {
-            Log.w(TAG, "background/runtime heartbeat failed code=${result.code}")
+        if (result.isSuccessCode()) {
+            syncDeviceIdentityFromServerResponse(result.body)
+            return
         }
+        Log.w(TAG, "background/runtime heartbeat failed uid=$deviceUid code=${result.code}")
     }
 
     private fun fetchPendingCommands(): List<ServerCallCommand> {
+        val deviceUid = currentDeviceUid()
         val encodedDeviceUid = URLEncoder.encode(
-            DEVICE_UID,
+            deviceUid,
             StandardCharsets.UTF_8.toString()
         )
         val result = get("$SERVER/commands?deviceUid=$encodedDeviceUid&status=pending")
         if (!result.isSuccessCode()) {
-            Log.w(TAG, "background/runtime command poll failed code=${result.code}")
+            Log.w(
+                TAG,
+                "background/runtime command poll failed uid=$deviceUid code=${result.code}"
+            )
             return emptyList()
         }
         return parseCommands(result.body)
@@ -614,6 +625,30 @@ class AutoCallCommandPollingService : Service() {
                 appContext,
                 permission
             ) == PackageManager.PERMISSION_GRANTED
+        }
+    }
+
+    private fun currentDeviceUid(): String {
+        return DeviceIdentityStore.getOrCreateDeviceUid(applicationContext)
+    }
+
+    private fun syncDeviceIdentityFromServerResponse(rawBody: String) {
+        if (rawBody.isBlank()) {
+            return
+        }
+
+        try {
+            val root = JSONObject(rawBody)
+            val device = root.optJSONObject("device") ?: return
+            val serverDeviceUid = if (device.isNull("deviceUid")) null else device.optString("deviceUid")
+            val serverDeviceName = if (device.isNull("deviceName")) null else device.optString("deviceName")
+            DeviceIdentityStore.syncFromServer(
+                context = applicationContext,
+                deviceUid = serverDeviceUid,
+                deviceName = serverDeviceName
+            )
+        } catch (error: Throwable) {
+            Log.w(TAG, "background/runtime identity sync parse failed", error)
         }
     }
 

@@ -8,6 +8,11 @@ export type AutoAnswerStatus = {
   lastEventAt: number;
 };
 
+export type DeviceIdentity = {
+  deviceUid: string;
+  deviceName: string;
+};
+
 type OutgoingCallResult = {
   action: string;
   phoneNumber: string;
@@ -42,6 +47,7 @@ type AutoCallNativeModule = {
   enableAutoAnswer(config: { autoHangupSeconds: number }): Promise<AutoAnswerStatus>;
   disableAutoAnswer(): Promise<AutoAnswerStatus>;
   getAutoAnswerStatus(): Promise<AutoAnswerStatus>;
+  getDeviceIdentity(): Promise<DeviceIdentity>;
   endCurrentCall(): Promise<{ ended: boolean }>;
 };
 
@@ -70,6 +76,8 @@ export const enableAutoAnswer = (autoHangupSeconds: number) =>
 export const disableAutoAnswer = () => getNativeModule().disableAutoAnswer();
 
 export const getStatus = () => getNativeModule().getAutoAnswerStatus();
+
+export const getDeviceIdentity = () => getNativeModule().getDeviceIdentity();
 
 export const endCurrentCall = async () => {
   return getNativeModule().endCurrentCall();

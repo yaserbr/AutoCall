@@ -11,7 +11,9 @@ import {
 } from "react-native";
 import {
   type AutoAnswerStatus,
+  type DeviceIdentity,
   disableAutoAnswer,
+  getDeviceIdentity,
   enableAutoAnswer,
   endCurrentCall,
   getStatus,
@@ -21,7 +23,6 @@ import {
 } from "../../src/native/autoCallNative";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
-const DEVICE_UID = "device_123";
 const POLL_INTERVAL_MS = 10000;
 const DEFAULT_PHONE = "05";
 const DEFAULT_HANGUP_SECONDS = 20;
@@ -45,6 +46,11 @@ type ServerCallCommand = {
   failureReason?: string | null;
   status: string;
   scheduledAt?: string;
+};
+
+type ServerDevice = {
+  deviceUid?: string;
+  deviceName?: string | null;
 };
 
 type UiState = {
@@ -92,6 +98,11 @@ const normalizePhoneNumber = (input: string): string | null => {
 const formatTime = (timestamp: number): string => {
   if (!timestamp) return "--";
   return new Date(timestamp).toLocaleString();
+};
+
+const emptyDeviceIdentity: DeviceIdentity = {
+  deviceUid: "",
+  deviceName: "",
 };
 
 const parseScheduledAtMs = (scheduledAt?: string | null): number | null => {
@@ -180,6 +191,7 @@ const parseScheduledAtMs = (scheduledAt?: string | null): number | null => {
 
 export default function AutoCallScreen() {
   const [uiState, setUiState] = useState<UiState>(emptyState);
+  const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity>(emptyDeviceIdentity);
   const [statusMessage, setStatusMessage] = useState("Ready");
   const [phoneNumber, setPhoneNumber] = useState(DEFAULT_PHONE);
   const [autoHangupSecondsText, setAutoHangupSecondsText] = useState(String(DEFAULT_HANGUP_SECONDS));
@@ -189,6 +201,8 @@ export default function AutoCallScreen() {
   const [nextServerCommand, setNextServerCommand] = useState<ServerCallCommand | null>(null);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
   const executedCommandIds = useRef<Set<string>>(new Set());
+  const deviceUidRef = useRef<string>("");
+  const deviceNameRef = useRef<string>("");
 
   const updateUiFromStatus = (status: AutoAnswerStatus) => {
     setUiState({
@@ -199,6 +213,73 @@ export default function AutoCallScreen() {
       lastEventAt: status.lastEventAt,
     });
     setAutoHangupSecondsText(String(status.autoHangupSeconds));
+  };
+
+  const applyDeviceIdentity = (identity: DeviceIdentity) => {
+    const normalizedUid = typeof identity.deviceUid === "string" ? identity.deviceUid.trim() : "";
+    const normalizedName = typeof identity.deviceName === "string" ? identity.deviceName.trim() : "";
+
+    deviceUidRef.current = normalizedUid;
+    deviceNameRef.current = normalizedName;
+    setDeviceIdentity({
+      deviceUid: normalizedUid,
+      deviceName: normalizedName,
+    });
+  };
+
+  const refreshDeviceIdentity = async (): Promise<DeviceIdentity | null> => {
+    try {
+      const identity = await getDeviceIdentity();
+      applyDeviceIdentity(identity);
+      return identity;
+    } catch (error) {
+      logEvent("device_identity_refresh_failed", { error });
+      return null;
+    }
+  };
+
+  const getCurrentDeviceUid = async (): Promise<string | null> => {
+    if (deviceUidRef.current) {
+      return deviceUidRef.current;
+    }
+
+    const identity = await refreshDeviceIdentity();
+    const normalizedUid = identity?.deviceUid?.trim() ?? "";
+    return normalizedUid || null;
+  };
+
+  const applyDeviceFromServer = (device?: ServerDevice | null) => {
+    if (!device || typeof device !== "object") {
+      return;
+    }
+
+    const serverUid =
+      typeof device.deviceUid === "string" && device.deviceUid.trim()
+        ? device.deviceUid.trim()
+        : "";
+    if (!serverUid) {
+      return;
+    }
+
+    const currentUid = deviceUidRef.current || serverUid;
+    if (currentUid && serverUid !== currentUid) {
+      return;
+    }
+
+    const serverName =
+      typeof device.deviceName === "string" && device.deviceName.trim()
+        ? device.deviceName.trim()
+        : "";
+    if (!serverName) {
+      return;
+    }
+
+    deviceUidRef.current = currentUid || serverUid;
+    deviceNameRef.current = serverName;
+    setDeviceIdentity((previous) => ({
+      deviceUid: previous.deviceUid || currentUid || serverUid,
+      deviceName: serverName,
+    }));
   };
 
   const refreshStatus = async () => {
@@ -252,11 +333,24 @@ export default function AutoCallScreen() {
 
   const registerDevice = async () => {
     try {
-      await fetch(`${SERVER}/devices/register`, {
+      const deviceUid = await getCurrentDeviceUid();
+      if (!deviceUid) {
+        logEvent("register_device_skipped_missing_uid");
+        return;
+      }
+
+      const response = await fetch(`${SERVER}/devices/register`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceUid: DEVICE_UID }),
+        body: JSON.stringify({ deviceUid }),
       });
+
+      if (!response.ok) {
+        return;
+      }
+
+      const data = (await response.json()) as { device?: ServerDevice | null };
+      applyDeviceFromServer(data.device);
     } catch (error) {
       logEvent("register_device_failed", { error });
     }
@@ -264,11 +358,24 @@ export default function AutoCallScreen() {
 
   const sendHeartbeat = async () => {
     try {
-      await fetch(`${SERVER}/devices/heartbeat`, {
+      const deviceUid = await getCurrentDeviceUid();
+      if (!deviceUid) {
+        logEvent("heartbeat_skipped_missing_uid");
+        return;
+      }
+
+      const response = await fetch(`${SERVER}/devices/heartbeat`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceUid: DEVICE_UID }),
+        body: JSON.stringify({ deviceUid }),
       });
+
+      if (!response.ok) {
+        return;
+      }
+
+      const data = (await response.json()) as { device?: ServerDevice | null };
+      applyDeviceFromServer(data.device);
     } catch (error) {
       logEvent("heartbeat_failed", { error });
     }
@@ -568,7 +675,14 @@ export default function AutoCallScreen() {
 
   const pollCommands = async () => {
     try {
-      const response = await fetch(`${SERVER}/commands?deviceUid=${DEVICE_UID}&status=pending`);
+      const deviceUid = await getCurrentDeviceUid();
+      if (!deviceUid) {
+        logEvent("poll_commands_skipped_missing_uid");
+        return;
+      }
+
+      const encodedUid = encodeURIComponent(deviceUid);
+      const response = await fetch(`${SERVER}/commands?deviceUid=${encodedUid}&status=pending`);
       if (!response.ok) return;
 
       const commands = (await response.json()) as ServerCallCommand[];
@@ -746,8 +860,10 @@ export default function AutoCallScreen() {
 
     const init = async () => {
       await requestAndroidPermissions();
+      await refreshDeviceIdentity();
       await refreshStatus();
       await registerDevice();
+      await sendHeartbeat();
       await pollCommands();
 
       heartbeatTimer = setInterval(() => {
@@ -843,6 +959,8 @@ export default function AutoCallScreen() {
         </View>
 
         <View style={styles.statusBox}>
+          <Text style={styles.statusLine}>Device UID: {deviceIdentity.deviceUid || "--"}</Text>
+          <Text style={styles.statusLine}>Device Name: {deviceIdentity.deviceName || "--"}</Text>
           <Text style={styles.statusLine}>Auto Answer: {uiState.autoAnswerEnabled ? "ON" : "OFF"}</Text>
           <Text style={styles.statusLine}>Auto Hangup: {uiState.autoHangupSeconds}s</Text>
           <Text style={styles.statusLine}>Hangup Timer: {uiState.hangupScheduled ? "Scheduled" : "Idle"}</Text>

@@ -289,6 +289,21 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun getDeviceIdentity(promise: Promise) {
+        try {
+            val snapshot = DeviceIdentityStore.snapshot(reactContext)
+            val map = Arguments.createMap().apply {
+                putString("deviceUid", snapshot.deviceUid)
+                putString("deviceName", snapshot.deviceName)
+            }
+            promise.resolve(map)
+        } catch (error: Throwable) {
+            Log.e(TAG, "getDeviceIdentity failed", error)
+            promise.reject("E_GET_DEVICE_IDENTITY_FAILED", error.message, error)
+        }
+    }
+
+    @ReactMethod
     fun endCurrentCall(promise: Promise) {
         try {
             Log.i(TAG, "Ending current call")
