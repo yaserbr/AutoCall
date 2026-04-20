@@ -15,6 +15,8 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     companion object {
         private const val TAG = "AutoCall/NativeModule"
         private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
+        private const val SEND_SMS_PERMISSION_DENIED_CODE = "E_SEND_SMS_PERMISSION_DENIED"
+        private const val SEND_SMS_PERMISSION_DENIED_MESSAGE = "SEND_SMS permission denied"
     }
 
     override fun getName() = "AutoCallNative"
@@ -160,23 +162,98 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun startServerCommandSms(phoneNumber: String, message: String, promise: Promise) {
+        Log.i(
+            TAG,
+            "Server command SMS received phone=$phoneNumber messageLength=${message.length}"
+        )
+        UiThreadUtil.runOnUiThread {
+            try {
+                val result = SimpleSmsManager.sendServerCommandSms(
+                    context = reactContext,
+                    rawPhoneNumber = phoneNumber,
+                    rawMessage = message
+                )
+
+                val map = Arguments.createMap().apply {
+                    putBoolean("success", result.success)
+                    putString("reason", result.reason)
+                    putString("message", result.message)
+                    if (result.phoneNumber != null) {
+                        putString("phoneNumber", result.phoneNumber)
+                    } else {
+                        putNull("phoneNumber")
+                    }
+                    if (result.textLength != null) {
+                        putDouble("textLength", result.textLength.toDouble())
+                    } else {
+                        putNull("textLength")
+                    }
+                    putDouble("timestamp", result.timestamp.toDouble())
+                }
+                promise.resolve(map)
+            } catch (error: AutoCallException) {
+                Log.e(TAG, "startServerCommandSms failed code=${error.code} message=${error.message}")
+                val map = Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putString(
+                        "reason",
+                        if (error.code == SEND_SMS_PERMISSION_DENIED_CODE) {
+                            "permission_denied"
+                        } else {
+                            "start_server_command_sms_failed"
+                        }
+                    )
+                    putString(
+                        "message",
+                        if (error.code == SEND_SMS_PERMISSION_DENIED_CODE) {
+                            SEND_SMS_PERMISSION_DENIED_MESSAGE
+                        } else {
+                            error.message ?: "Unexpected error while sending server command SMS"
+                        }
+                    )
+                    putNull("phoneNumber")
+                    putNull("textLength")
+                    putDouble("timestamp", System.currentTimeMillis().toDouble())
+                }
+                promise.resolve(map)
+            } catch (error: Throwable) {
+                Log.e(TAG, "startServerCommandSms failed", error)
+                val map = Arguments.createMap().apply {
+                    putBoolean("success", false)
+                    putString("reason", "start_server_command_sms_failed")
+                    putString(
+                        "message",
+                        error.message ?: "Unexpected error while sending server command SMS"
+                    )
+                    putNull("phoneNumber")
+                    putNull("textLength")
+                    putDouble("timestamp", System.currentTimeMillis().toDouble())
+                }
+                promise.resolve(map)
+            }
+        }
+    }
+
+    @ReactMethod
     fun enableAutoAnswer(config: ReadableMap?, promise: Promise) {
         try {
-            val requestedSeconds = if (
+            val requestedSeconds: Int? = if (
                 config != null &&
                 config.hasKey("autoHangupSeconds") &&
                 !config.isNull("autoHangupSeconds")
             ) {
                 config.getInt("autoHangupSeconds")
             } else {
-                AutoAnswerStore.getAutoHangupSeconds(reactContext)
+                null
             }
 
-            val normalizedSeconds = requestedSeconds.coerceIn(1, 600)
-            AutoAnswerStore.setAutoHangupSeconds(reactContext, normalizedSeconds)
-            AutoAnswerStore.setEnabled(reactContext, true)
-            AutoAnswerStore.setLastEvent(reactContext, "Auto answer enabled")
-            Log.i(TAG, "Auto answer enabled")
+            AutoAnswerController.applyAutoAnswerSettings(
+                context = reactContext,
+                enabled = true,
+                requestedAutoHangupSeconds = requestedSeconds
+            )
+            Log.i(TAG, "Auto answer enabled from native module")
 
             promise.resolve(buildStatusMap())
         } catch (error: Throwable) {
@@ -188,10 +265,12 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     @ReactMethod
     fun disableAutoAnswer(promise: Promise) {
         try {
-            AutoAnswerStore.setEnabled(reactContext, false)
-            AutoAnswerController.onAutoAnswerDisabled(reactContext)
-            AutoAnswerStore.setLastEvent(reactContext, "Auto answer disabled")
-            Log.i(TAG, "Auto answer disabled")
+            AutoAnswerController.applyAutoAnswerSettings(
+                context = reactContext,
+                enabled = false,
+                requestedAutoHangupSeconds = null
+            )
+            Log.i(TAG, "Auto answer disabled from native module")
             promise.resolve(buildStatusMap())
         } catch (error: Throwable) {
             Log.e(TAG, "disableAutoAnswer failed", error)

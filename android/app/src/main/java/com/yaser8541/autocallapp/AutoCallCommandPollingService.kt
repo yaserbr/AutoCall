@@ -1,5 +1,6 @@
 package com.yaser8541.autocallapp
 
+import android.Manifest
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -7,11 +8,13 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Context
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
@@ -29,6 +32,7 @@ class AutoCallCommandPollingService : Service() {
         private const val SERVER = "https://serverautocall-production.up.railway.app"
         private const val DEVICE_UID = "device_123"
         private const val POLL_INTERVAL_MS = 10_000L
+        private const val MAX_AUTO_HANGUP_SECONDS = 600
         private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
         private const val RIYADH_TIMEZONE_ID = "Asia/Riyadh"
 
@@ -57,7 +61,10 @@ class AutoCallCommandPollingService : Service() {
         val action: String?,
         val type: String,
         val phoneNumber: String?,
+        val message: String?,
         val durationSeconds: Int?,
+        val enabled: Boolean?,
+        val autoHangupSeconds: Int?,
         val scheduledAt: String?
     )
 
@@ -258,7 +265,14 @@ class AutoCallCommandPollingService : Service() {
                         } else {
                             item.optString("phoneNumber").takeIf { value -> value.isNotBlank() }
                         },
+                        message = if (item.isNull("message")) {
+                            null
+                        } else {
+                            item.optString("message").takeIf { value -> value.isNotBlank() }
+                        },
                         durationSeconds = parseDurationSeconds(item),
+                        enabled = parseAutoAnswerEnabled(item),
+                        autoHangupSeconds = parseAutoHangupSeconds(item),
                         scheduledAt = if (item.isNull("scheduledAt")) null else item.optString("scheduledAt")
                     )
                 )
@@ -299,6 +313,8 @@ class AutoCallCommandPollingService : Service() {
             )
             val success = when (action) {
                 "end" -> dispatchEndCommand(command)
+                "sms" -> dispatchSmsCommand(command)
+                "auto_answer" -> dispatchAutoAnswerCommand(command)
                 else -> dispatchCallCommand(command)
             }
             if (success) {
@@ -312,7 +328,72 @@ class AutoCallCommandPollingService : Service() {
         if (!explicitAction.isNullOrBlank()) {
             return explicitAction
         }
-        return if (command.type.equals("END", ignoreCase = true)) "end" else "call"
+        return when {
+            command.type.equals("END", ignoreCase = true) -> "end"
+            command.type.equals("SMS", ignoreCase = true) -> "sms"
+            command.type.equals("AUTO_ANSWER", ignoreCase = true) -> "auto_answer"
+            else -> "call"
+        }
+    }
+
+    private fun dispatchAutoAnswerCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            val enabled = command.enabled
+            if (enabled == null) {
+                Log.w(
+                    TAG,
+                    "background/runtime auto-answer command missing enabled commandId=${command.id}"
+                )
+                updateCommandStatus(command.id, "failed", "AUTO_ANSWER command missing enabled")
+                return false
+            }
+
+            if (enabled && !hasAutoAnswerPermissions()) {
+                Log.w(
+                    TAG,
+                    "background/runtime auto-answer command missing permissions commandId=${command.id}"
+                )
+                updateCommandStatus(
+                    command.id,
+                    "failed",
+                    "AUTO_ANSWER permissions missing: ANSWER_PHONE_CALLS/READ_PHONE_STATE"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executing")
+            AutoAnswerController.applyAutoAnswerSettings(
+                context = applicationContext,
+                enabled = enabled,
+                requestedAutoHangupSeconds = if (enabled) {
+                    command.autoHangupSeconds
+                } else {
+                    null
+                }
+            )
+            updateCommandStatus(command.id, "executed")
+            Log.i(
+                TAG,
+                "background/runtime auto-answer command executed commandId=${command.id} " +
+                    "enabled=$enabled autoHangupSeconds=${command.autoHangupSeconds ?: "null"}"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(
+                TAG,
+                "background/runtime auto-answer command crash commandId=${command.id}",
+                error
+            )
+            updateCommandStatus(
+                command.id,
+                "failed",
+                error.message ?: "auto_answer_command_crash"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
     }
 
     private fun dispatchEndCommand(command: ServerCallCommand): Boolean {
@@ -330,7 +411,7 @@ class AutoCallCommandPollingService : Service() {
                 Log.i(TAG, "background/runtime end command executed commandId=${command.id}")
                 return true
             } else {
-                updateCommandStatus(command.id, "failed")
+                updateCommandStatus(command.id, "failed", result.reason)
                 Log.w(
                     TAG,
                     "background/runtime end command failed commandId=${command.id} " +
@@ -341,7 +422,7 @@ class AutoCallCommandPollingService : Service() {
             }
         } catch (error: Throwable) {
             Log.e(TAG, "background/runtime end command crash commandId=${command.id}", error)
-            updateCommandStatus(command.id, "failed")
+            updateCommandStatus(command.id, "failed", error.message ?: "end_command_crash")
             return false
         } finally {
             inFlightCommandIds.remove(command.id)
@@ -354,7 +435,7 @@ class AutoCallCommandPollingService : Service() {
             val phoneNumber = command.phoneNumber
             if (phoneNumber.isNullOrBlank()) {
                 Log.w(TAG, "background/runtime call command missing phone commandId=${command.id}")
-                updateCommandStatus(command.id, "failed")
+                updateCommandStatus(command.id, "failed", "CALL command missing phoneNumber")
                 return false
             }
 
@@ -366,7 +447,11 @@ class AutoCallCommandPollingService : Service() {
                 activity = null
             )
             if (!callResult.success) {
-                updateCommandStatus(command.id, "failed")
+                updateCommandStatus(
+                    command.id,
+                    "failed",
+                    "${callResult.reason}: ${callResult.message}"
+                )
                 Log.w(
                     TAG,
                     "background/runtime call command failed commandId=${command.id} " +
@@ -384,23 +469,84 @@ class AutoCallCommandPollingService : Service() {
             return true
         } catch (error: Throwable) {
             Log.e(TAG, "background/runtime call command crash commandId=${command.id}", error)
-            updateCommandStatus(command.id, "failed")
+            updateCommandStatus(command.id, "failed", error.message ?: "call_command_crash")
             return false
         } finally {
             inFlightCommandIds.remove(command.id)
         }
     }
 
-    private fun updateCommandStatus(commandId: String, status: String) {
+    private fun dispatchSmsCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            val phoneNumber = command.phoneNumber
+            if (phoneNumber.isNullOrBlank()) {
+                Log.w(TAG, "background/runtime sms command missing phone commandId=${command.id}")
+                updateCommandStatus(command.id, "failed", "SMS command missing phoneNumber")
+                return false
+            }
+
+            val message = command.message
+            if (message.isNullOrBlank()) {
+                Log.w(TAG, "background/runtime sms command missing message commandId=${command.id}")
+                updateCommandStatus(command.id, "failed", "SMS command missing message")
+                return false
+            }
+
+            updateCommandStatus(command.id, "executing")
+            val smsResult = SimpleSmsManager.sendServerCommandSms(
+                context = applicationContext,
+                rawPhoneNumber = phoneNumber,
+                rawMessage = message
+            )
+            if (!smsResult.success) {
+                updateCommandStatus(command.id, "failed", smsResult.message)
+                Log.w(
+                    TAG,
+                    "background/runtime sms command failed commandId=${command.id} " +
+                        "reason=${smsResult.reason} message=${smsResult.message}"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            Log.i(TAG, "background/runtime sms command executed commandId=${command.id}")
+            return true
+        } catch (error: AutoCallException) {
+            val failureReason = error.message ?: "SEND_SMS permission denied"
+            Log.w(
+                TAG,
+                "background/runtime sms command blocked commandId=${command.id} " +
+                    "code=${error.code} message=$failureReason"
+            )
+            updateCommandStatus(command.id, "failed", failureReason)
+            return false
+        } catch (error: Throwable) {
+            Log.e(TAG, "background/runtime sms command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", error.message ?: "sms_command_crash")
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
+    private fun updateCommandStatus(
+        commandId: String,
+        status: String,
+        failureReason: String? = null
+    ) {
         val payload = JSONObject().apply {
             put("status", status)
+            if (!failureReason.isNullOrBlank()) {
+                put("failureReason", failureReason)
+            }
         }
         val result = postJson("$SERVER/commands/$commandId/status", payload)
         if (!result.isSuccessCode()) {
             Log.w(
                 TAG,
                 "background/runtime update command status failed commandId=$commandId " +
-                    "status=$status code=${result.code}"
+                    "status=$status failureReason=${failureReason ?: "null"} code=${result.code}"
             )
         }
     }
@@ -418,6 +564,57 @@ class AutoCallCommandPollingService : Service() {
             return null
         }
         return normalized.coerceAtMost(MAX_SERVER_CALL_DURATION_SECONDS)
+    }
+
+    private fun parseAutoAnswerEnabled(item: JSONObject): Boolean? {
+        if (!item.has("enabled") || item.isNull("enabled")) {
+            return null
+        }
+
+        return try {
+            when (val raw = item.get("enabled")) {
+                is Boolean -> raw
+                is String -> {
+                    when (raw.trim().lowercase(Locale.US)) {
+                        "true" -> true
+                        "false" -> false
+                        else -> null
+                    }
+                }
+                else -> null
+            }
+        } catch (_: Throwable) {
+            null
+        }
+    }
+
+    private fun parseAutoHangupSeconds(item: JSONObject): Int? {
+        if (item.isNull("autoHangupSeconds")) {
+            return null
+        }
+        val raw = item.optDouble("autoHangupSeconds", Double.NaN)
+        if (raw.isNaN() || raw <= 0.0) {
+            return null
+        }
+        val normalized = raw.toInt()
+        if (normalized <= 0) {
+            return null
+        }
+        return normalized.coerceAtMost(MAX_AUTO_HANGUP_SECONDS)
+    }
+
+    private fun hasAutoAnswerPermissions(): Boolean {
+        val appContext = applicationContext
+        val requiredPermissions = arrayOf(
+            Manifest.permission.ANSWER_PHONE_CALLS,
+            Manifest.permission.READ_PHONE_STATE
+        )
+        return requiredPermissions.all { permission ->
+            ContextCompat.checkSelfPermission(
+                appContext,
+                permission
+            ) == PackageManager.PERMISSION_GRANTED
+        }
     }
 
     private fun commandSortKey(command: ServerCallCommand): Long {

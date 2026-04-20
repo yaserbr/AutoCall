@@ -17,6 +17,7 @@ import {
   getStatus,
   startSimpleCall,
   startServerCommandCall,
+  startServerCommandSms,
 } from "../../src/native/autoCallNative";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
@@ -25,17 +26,23 @@ const POLL_INTERVAL_MS = 10000;
 const DEFAULT_PHONE = "05";
 const DEFAULT_HANGUP_SECONDS = 20;
 const DEFAULT_SIMPLE_CALL_DURATION_SECONDS = 20;
+const MAX_AUTO_HANGUP_SECONDS = 600;
 const MAX_SIMPLE_CALL_DURATION_SECONDS = 3600;
 const RIYADH_UTC_OFFSET_MS = 3 * 60 * 60 * 1000;
 const LOG_PREFIX = "[AutoCall/UI]";
+const SMS_PERMISSION_DENIED_REASON = "SEND_SMS permission denied";
 
 type ServerCallCommand = {
   id: string;
   deviceUid: string;
-  action?: "call" | "end";
-  type: "CALL" | "END";
+  action?: "call" | "end" | "sms" | "auto_answer";
+  type: "CALL" | "END" | "SMS" | "AUTO_ANSWER";
   phoneNumber?: string | null;
+  message?: string | null;
   durationSeconds?: number | null;
+  enabled?: boolean | null;
+  autoHangupSeconds?: number | null;
+  failureReason?: string | null;
   status: string;
   scheduledAt?: string;
 };
@@ -47,6 +54,8 @@ type UiState = {
   lastEvent: string;
   lastEventAt: number;
 };
+type AndroidPermission =
+  (typeof PermissionsAndroid.PERMISSIONS)[keyof typeof PermissionsAndroid.PERMISSIONS];
 
 const emptyState: UiState = {
   autoAnswerEnabled: false,
@@ -203,16 +212,25 @@ export default function AutoCallScreen() {
     }
   };
 
-  const requestAndroidPermissions = async (): Promise<boolean> => {
+  const requestAndroidPermissions = async (
+    requiredPermissions?: AndroidPermission[]
+  ): Promise<boolean> => {
     if (Platform.OS !== "android") return true;
 
-    const permissions = [
-      PermissionsAndroid.PERMISSIONS.CALL_PHONE,
-      PermissionsAndroid.PERMISSIONS.ANSWER_PHONE_CALLS,
-      PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
-    ];
+    const permissions =
+      requiredPermissions ??
+      [
+        PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+        PermissionsAndroid.PERMISSIONS.ANSWER_PHONE_CALLS,
+        PermissionsAndroid.PERMISSIONS.READ_PHONE_STATE,
+      ];
 
     for (const permission of permissions) {
+      const isGranted = await PermissionsAndroid.check(permission);
+      if (isGranted) {
+        continue;
+      }
+
       const granted = await PermissionsAndroid.request(permission);
       if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
         setStatusMessage(`Permission denied: ${permission}`);
@@ -221,7 +239,12 @@ export default function AutoCallScreen() {
     }
 
     if (Platform.Version >= 33) {
-      await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+      const hasNotificationPermission = await PermissionsAndroid.check(
+        PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS
+      );
+      if (!hasNotificationPermission) {
+        await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.POST_NOTIFICATIONS);
+      }
     }
 
     return true;
@@ -251,15 +274,23 @@ export default function AutoCallScreen() {
     }
   };
 
-  const updateCommandStatus = async (id: string, status: string) => {
+  const updateCommandStatus = async (
+    id: string,
+    status: string,
+    failureReason?: string | null
+  ) => {
     try {
+      const payload: { status: string; failureReason?: string } = { status };
+      if (typeof failureReason === "string" && failureReason.trim()) {
+        payload.failureReason = failureReason.trim();
+      }
       await fetch(`${SERVER}/commands/${id}/status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ status }),
+        body: JSON.stringify(payload),
       });
     } catch (error) {
-      logEvent("update_command_status_failed", { id, status, error });
+      logEvent("update_command_status_failed", { id, status, failureReason, error });
     }
   };
 
@@ -284,6 +315,19 @@ export default function AutoCallScreen() {
     }
 
     const clamped = Math.min(durationSeconds, MAX_SIMPLE_CALL_DURATION_SECONDS);
+    return Math.round(clamped);
+  };
+
+  const parseServerAutoHangupSeconds = (autoHangupSeconds?: number | null): number | null => {
+    if (
+      typeof autoHangupSeconds !== "number" ||
+      !Number.isFinite(autoHangupSeconds) ||
+      autoHangupSeconds <= 0
+    ) {
+      return null;
+    }
+
+    const clamped = Math.max(1, Math.min(autoHangupSeconds, MAX_AUTO_HANGUP_SECONDS));
     return Math.round(clamped);
   };
 
@@ -387,6 +431,117 @@ export default function AutoCallScreen() {
     }
   };
 
+  const executeSmsCommand = async (
+    rawPhoneNumber: string,
+    rawMessage: string,
+    commandId: string
+  ): Promise<boolean> => {
+    const normalizedPhone = normalizePhoneNumber(rawPhoneNumber);
+    if (!normalizedPhone) {
+      await updateCommandStatus(commandId, "failed", "Invalid SMS phone number");
+      setStatusMessage("Invalid SMS phone number from server command");
+      return false;
+    }
+
+    const normalizedMessage = rawMessage.trim();
+    if (!normalizedMessage) {
+      await updateCommandStatus(commandId, "failed", "SMS message is empty");
+      setStatusMessage("SMS command message is empty");
+      return false;
+    }
+
+    try {
+      inFlightCommandIds.current.add(commandId);
+      await updateCommandStatus(commandId, "executing");
+
+      const hasPermissions = await requestAndroidPermissions([
+        PermissionsAndroid.PERMISSIONS.SEND_SMS,
+      ]);
+      if (!hasPermissions) {
+        await updateCommandStatus(commandId, "failed", SMS_PERMISSION_DENIED_REASON);
+        setStatusMessage(`SMS command failed: ${SMS_PERMISSION_DENIED_REASON}`);
+        return false;
+      }
+
+      const smsResult = await startServerCommandSms(normalizedPhone, normalizedMessage);
+      if (!smsResult.success) {
+        const failureReason =
+          smsResult.reason === "permission_denied" ? SMS_PERMISSION_DENIED_REASON : smsResult.message;
+        await updateCommandStatus(commandId, "failed", failureReason);
+        setStatusMessage(`SMS command failed: ${failureReason}`);
+        return false;
+      }
+
+      await updateCommandStatus(commandId, "executed");
+      setStatusMessage("SMS sent from server command");
+      return true;
+    } catch (error) {
+      logEvent("execute_sms_command_failed", { error, commandId });
+      await updateCommandStatus(commandId, "failed", "Failed to send SMS");
+      setStatusMessage("Failed to execute SMS command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
+  const executeAutoAnswerCommand = async (command: ServerCallCommand): Promise<boolean> => {
+    const commandId = command.id;
+    try {
+      inFlightCommandIds.current.add(commandId);
+      await updateCommandStatus(commandId, "executing");
+
+      if (typeof command.enabled !== "boolean") {
+        await updateCommandStatus(commandId, "failed", "AUTO_ANSWER command missing enabled");
+        setStatusMessage("AUTO_ANSWER command missing enabled");
+        return false;
+      }
+
+      if (command.enabled) {
+        const hasPermissions = await requestAndroidPermissions();
+        if (!hasPermissions) {
+          await updateCommandStatus(commandId, "failed", "Missing required phone permissions");
+          setStatusMessage("AUTO_ANSWER failed: missing required phone permissions");
+          return false;
+        }
+
+        const hasRequestedAutoHangup =
+          command.autoHangupSeconds !== undefined && command.autoHangupSeconds !== null;
+        const parsedAutoHangupSeconds = parseServerAutoHangupSeconds(command.autoHangupSeconds);
+        if (hasRequestedAutoHangup && parsedAutoHangupSeconds === null) {
+          await updateCommandStatus(
+            commandId,
+            "failed",
+            "AUTO_ANSWER command has invalid autoHangupSeconds"
+          );
+          setStatusMessage("AUTO_ANSWER command has invalid autoHangupSeconds");
+          return false;
+        }
+
+        const currentStatus = await getStatus();
+        const requestedSeconds = parsedAutoHangupSeconds ?? currentStatus.autoHangupSeconds;
+        const status = await enableAutoAnswer(requestedSeconds);
+        updateUiFromStatus(status);
+        await updateCommandStatus(commandId, "executed");
+        setStatusMessage(`Auto Answer ON (${status.autoHangupSeconds}s) from server command`);
+        return true;
+      }
+
+      const status = await disableAutoAnswer();
+      updateUiFromStatus(status);
+      await updateCommandStatus(commandId, "executed");
+      setStatusMessage("Auto Answer OFF from server command");
+      return true;
+    } catch (error) {
+      logEvent("execute_auto_answer_command_failed", { error, commandId, command });
+      await updateCommandStatus(commandId, "failed", "Failed to apply AUTO_ANSWER command");
+      setStatusMessage("Failed to execute AUTO_ANSWER command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
   const getScheduledAtMs = (command: ServerCallCommand): number | null => {
     return parseScheduledAtMs(command.scheduledAt ?? null);
   };
@@ -419,7 +574,7 @@ export default function AutoCallScreen() {
       const commands = (await response.json()) as ServerCallCommand[];
       const dueCommands = [...commands].sort((a, b) => getCommandSortKey(a) - getCommandSortKey(b));
 
-      setNextServerCommand(dueCommands.find((command) => command.type === "CALL") ?? null);
+      setNextServerCommand(dueCommands[0] ?? null);
 
       for (const command of dueCommands) {
         if (executedCommandIds.current.has(command.id)) {
@@ -437,7 +592,15 @@ export default function AutoCallScreen() {
 
         const action =
           command.action ??
-          (command.type === "END" ? "end" : "call");
+          (
+            command.type === "END"
+              ? "end"
+              : command.type === "SMS"
+                ? "sms"
+                : command.type === "AUTO_ANSWER"
+                  ? "auto_answer"
+                  : "call"
+          );
         logEvent("Executing scheduled command", {
           commandId: command.id,
           action,
@@ -452,8 +615,37 @@ export default function AutoCallScreen() {
           continue;
         }
 
+        if (action === "auto_answer") {
+          const applied = await executeAutoAnswerCommand(command);
+          if (applied) {
+            executedCommandIds.current.add(command.id);
+          }
+          continue;
+        }
+
+        if (action === "sms") {
+          if (!command.phoneNumber) {
+            await updateCommandStatus(command.id, "failed", "SMS command missing phoneNumber");
+            continue;
+          }
+          if (!command.message) {
+            await updateCommandStatus(command.id, "failed", "SMS command missing message");
+            continue;
+          }
+
+          const smsSent = await executeSmsCommand(
+            command.phoneNumber,
+            command.message,
+            command.id
+          );
+          if (smsSent) {
+            executedCommandIds.current.add(command.id);
+          }
+          continue;
+        }
+
         if (!command.phoneNumber) {
-          await updateCommandStatus(command.id, "failed");
+          await updateCommandStatus(command.id, "failed", "CALL command missing phoneNumber");
           continue;
         }
 
@@ -470,6 +662,25 @@ export default function AutoCallScreen() {
     } catch (error) {
       logEvent("poll_commands_failed", { error });
     }
+  };
+
+  const formatNextServerCommand = (command: ServerCallCommand | null): string => {
+    if (!command) {
+      return "No pending commands";
+    }
+
+    if (command.type === "AUTO_ANSWER") {
+      if (command.enabled === true) {
+        const parsedSeconds = parseServerAutoHangupSeconds(command.autoHangupSeconds);
+        return parsedSeconds ? `AUTO_ANSWER ON (${parsedSeconds}s)` : "AUTO_ANSWER ON";
+      }
+      if (command.enabled === false) {
+        return "AUTO_ANSWER OFF";
+      }
+      return "AUTO_ANSWER";
+    }
+
+    return `${command.type}${command.phoneNumber ? ` (${command.phoneNumber})` : ""}`;
   };
 
   const onToggleAutoAnswer = async (enabled: boolean) => {
@@ -638,7 +849,8 @@ export default function AutoCallScreen() {
           <Text style={styles.statusLine}>Last Event: {uiState.lastEvent || "--"}</Text>
           <Text style={styles.statusLine}>Event Time: {formatTime(uiState.lastEventAt)}</Text>
           <Text style={styles.statusLine}>
-            Next Server Call: {nextServerCommand?.phoneNumber ?? "No pending calls"}
+            Next Server Command:{" "}
+            {formatNextServerCommand(nextServerCommand)}
           </Text>
           <Text style={styles.statusMessage}>{statusMessage}</Text>
         </View>

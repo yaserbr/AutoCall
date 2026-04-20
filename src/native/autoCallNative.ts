@@ -25,10 +25,20 @@ type SimpleCallResult = {
   timestamp: number;
 };
 
+type SimpleSmsResult = {
+  success: boolean;
+  reason: string;
+  message: string;
+  phoneNumber: string | null;
+  textLength: number | null;
+  timestamp: number;
+};
+
 type AutoCallNativeModule = {
   startOutgoingCall(phoneNumber: string): Promise<OutgoingCallResult>;
   startSimpleCall(phoneNumber: string, autoEndMs: number | null): Promise<SimpleCallResult>;
   startServerCommandCall(phoneNumber: string, durationSeconds: number | null): Promise<SimpleCallResult>;
+  startServerCommandSms(phoneNumber: string, message: string): Promise<SimpleSmsResult>;
   enableAutoAnswer(config: { autoHangupSeconds: number }): Promise<AutoAnswerStatus>;
   disableAutoAnswer(): Promise<AutoAnswerStatus>;
   getAutoAnswerStatus(): Promise<AutoAnswerStatus>;
@@ -50,6 +60,9 @@ export const startSimpleCall = (phoneNumber: string, autoEndMs?: number | null) 
 
 export const startServerCommandCall = (phoneNumber: string, durationSeconds?: number | null) =>
   getNativeModule().startServerCommandCall(phoneNumber, durationSeconds ?? null);
+
+export const startServerCommandSms = (phoneNumber: string, message: string) =>
+  getNativeModule().startServerCommandSms(phoneNumber, message);
 
 export const enableAutoAnswer = (autoHangupSeconds: number) =>
   getNativeModule().enableAutoAnswer({ autoHangupSeconds });

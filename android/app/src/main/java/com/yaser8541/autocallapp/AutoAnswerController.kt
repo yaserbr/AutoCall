@@ -12,6 +12,7 @@ import androidx.core.content.ContextCompat
 
 object AutoAnswerController {
     private const val TAG = "AutoCall/AutoAnswer"
+    private const val MAX_AUTO_HANGUP_SECONDS = 600
     private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
 
     private val mainHandler = Handler(Looper.getMainLooper())
@@ -31,6 +32,30 @@ object AutoAnswerController {
 
     @Volatile
     private var outgoingServerHangupScheduled = false
+
+    fun applyAutoAnswerSettings(
+        context: Context,
+        enabled: Boolean,
+        requestedAutoHangupSeconds: Int?
+    ): AutoAnswerSnapshot {
+        val appContext = context.applicationContext
+
+        if (enabled) {
+            val currentSeconds = AutoAnswerStore.getAutoHangupSeconds(appContext)
+            val targetSeconds = normalizeAutoHangupSeconds(requestedAutoHangupSeconds ?: currentSeconds)
+            AutoAnswerStore.setAutoHangupSeconds(appContext, targetSeconds)
+            AutoAnswerStore.setEnabled(appContext, true)
+            AutoAnswerStore.setLastEvent(appContext, "Auto answer enabled")
+            Log.i(TAG, "Auto answer enabled autoHangupSeconds=$targetSeconds")
+        } else {
+            AutoAnswerStore.setEnabled(appContext, false)
+            onAutoAnswerDisabled(appContext)
+            AutoAnswerStore.setLastEvent(appContext, "Auto answer disabled")
+            Log.i(TAG, "Auto answer disabled")
+        }
+
+        return AutoAnswerStore.snapshot(appContext)
+    }
 
     fun onOutgoingCallStarted(context: Context) {
         onOutgoingCallStarted(context, null)
@@ -259,6 +284,10 @@ object AutoAnswerController {
             return null
         }
         return durationSeconds.coerceAtMost(MAX_SERVER_CALL_DURATION_SECONDS)
+    }
+
+    private fun normalizeAutoHangupSeconds(seconds: Int): Int {
+        return seconds.coerceIn(1, MAX_AUTO_HANGUP_SECONDS)
     }
 }
 
