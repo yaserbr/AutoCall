@@ -15,16 +15,12 @@ import android.os.HandlerThread
 import android.os.IBinder
 import android.util.Log
 import androidx.core.content.ContextCompat
-import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
-import java.net.URLEncoder
 import java.nio.charset.StandardCharsets
-import java.text.SimpleDateFormat
 import java.util.Collections
 import java.util.Locale
-import java.util.TimeZone
 
 class AutoCallCommandPollingService : Service() {
     companion object {
@@ -33,7 +29,7 @@ class AutoCallCommandPollingService : Service() {
         private const val POLL_INTERVAL_MS = 10_000L
         private const val MAX_AUTO_HANGUP_SECONDS = 600
         private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
-        private const val RIYADH_TIMEZONE_ID = "Asia/Riyadh"
+        private const val MAX_TRACKED_PROCESSED_COMMAND_IDS = 500
 
         private const val CHANNEL_ID = "autocall_background_command_polling"
         private const val CHANNEL_NAME = "AutoCall Background Runtime"
@@ -75,7 +71,7 @@ class AutoCallCommandPollingService : Service() {
     }
 
     private val inFlightCommandIds: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
-    private val executedCommandIds: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
+    private val processedCommandIds: MutableSet<String> = Collections.synchronizedSet(mutableSetOf())
 
     @Volatile
     private var destroyed = false
@@ -187,12 +183,12 @@ class AutoCallCommandPollingService : Service() {
             ensureDeviceRegistered()
             sendHeartbeat()
 
-            val commands = fetchPendingCommands()
+            val claimedCommand = claimNextCommand()
             Log.i(
                 TAG,
-                "server command poll received in background/runtime layer count=${commands.size}"
+                "background/runtime claim result commandId=${claimedCommand?.id ?: "null"}"
             )
-            processCommands(commands)
+            processClaimedCommand(claimedCommand)
         } catch (error: Throwable) {
             Log.e(TAG, "background/runtime poll failed", error)
         }
@@ -233,104 +229,142 @@ class AutoCallCommandPollingService : Service() {
         Log.w(TAG, "background/runtime heartbeat failed uid=$deviceUid code=${result.code}")
     }
 
-    private fun fetchPendingCommands(): List<ServerCallCommand> {
+    private fun claimNextCommand(): ServerCallCommand? {
         val deviceUid = currentDeviceUid()
-        val encodedDeviceUid = URLEncoder.encode(
-            deviceUid,
-            StandardCharsets.UTF_8.toString()
-        )
-        val result = get("$SERVER/commands?deviceUid=$encodedDeviceUid&status=pending")
+        val payload = JSONObject().apply {
+            put("deviceUid", deviceUid)
+        }
+        Log.i(TAG, "background/runtime command claim request uid=$deviceUid")
+        val result = postJson("$SERVER/commands/claim", payload)
         if (!result.isSuccessCode()) {
             Log.w(
                 TAG,
-                "background/runtime command poll failed uid=$deviceUid code=${result.code}"
+                "background/runtime command claim failed uid=$deviceUid code=${result.code}"
             )
-            return emptyList()
+            return null
         }
-        return parseCommands(result.body)
+        return parseClaimResponse(result.body, deviceUid)
     }
 
-    private fun parseCommands(rawJson: String): List<ServerCallCommand> {
+    private fun parseClaimResponse(rawJson: String, deviceUid: String): ServerCallCommand? {
         if (rawJson.isBlank()) {
-            return emptyList()
+            Log.i(TAG, "background/runtime command claim empty body uid=$deviceUid")
+            return null
         }
 
         return try {
-            val array = JSONArray(rawJson)
-            val parsed = mutableListOf<ServerCallCommand>()
-            for (index in 0 until array.length()) {
-                val item = array.optJSONObject(index) ?: continue
-                val id = item.optString("id", "")
-                val type = item.optString("type", "")
-                if (id.isBlank() || type.isBlank()) {
-                    continue
-                }
-
-                parsed.add(
-                    ServerCallCommand(
-                        id = id,
-                        action = if (item.isNull("action")) null else item.optString("action"),
-                        type = type,
-                        phoneNumber = if (item.isNull("phoneNumber")) {
-                            null
-                        } else {
-                            item.optString("phoneNumber").takeIf { value -> value.isNotBlank() }
-                        },
-                        message = if (item.isNull("message")) {
-                            null
-                        } else {
-                            item.optString("message").takeIf { value -> value.isNotBlank() }
-                        },
-                        durationSeconds = parseDurationSeconds(item),
-                        enabled = parseAutoAnswerEnabled(item),
-                        autoHangupSeconds = parseAutoHangupSeconds(item),
-                        scheduledAt = if (item.isNull("scheduledAt")) null else item.optString("scheduledAt")
-                    )
-                )
+            val root = JSONObject(rawJson)
+            val commandObject = root.optJSONObject("command")
+            if (commandObject == null) {
+                Log.i(TAG, "background/runtime command claim returned no command uid=$deviceUid")
+                return null
             }
-            parsed
+
+            val parsedCommand = parseCommand(commandObject)
+            if (parsedCommand == null) {
+                Log.w(TAG, "background/runtime command claim returned invalid command uid=$deviceUid")
+                return null
+            }
+            Log.i(
+                TAG,
+                "background/runtime command claimed uid=$deviceUid commandId=${parsedCommand.id} status=executing"
+            )
+            parsedCommand
         } catch (error: Throwable) {
-            Log.e(TAG, "failed to parse server commands in runtime layer", error)
-            emptyList()
+            Log.e(TAG, "failed to parse command claim response in runtime layer", error)
+            null
         }
     }
 
-    private fun processCommands(commands: List<ServerCallCommand>) {
-        val nowMs = System.currentTimeMillis()
-        val sortedCommands = commands.sortedBy { commandSortKey(it) }
+    private fun parseCommand(item: JSONObject): ServerCallCommand? {
+        val id = item.optString("id", "")
+        val type = item.optString("type", "")
+        if (id.isBlank() || type.isBlank()) {
+            return null
+        }
 
-        for (command in sortedCommands) {
-            if (executedCommandIds.contains(command.id)) {
-                Log.i(TAG, "Already executed, skipping commandId=${command.id}")
-                continue
-            }
-            if (inFlightCommandIds.contains(command.id)) {
-                continue
-            }
+        return ServerCallCommand(
+            id = id,
+            action = if (item.isNull("action")) null else item.optString("action"),
+            type = type,
+            phoneNumber = if (item.isNull("phoneNumber")) {
+                null
+            } else {
+                item.optString("phoneNumber").takeIf { value -> value.isNotBlank() }
+            },
+            message = if (item.isNull("message")) {
+                null
+            } else {
+                item.optString("message").takeIf { value -> value.isNotBlank() }
+            },
+            durationSeconds = parseDurationSeconds(item),
+            enabled = parseAutoAnswerEnabled(item),
+            autoHangupSeconds = parseAutoHangupSeconds(item),
+            scheduledAt = if (item.isNull("scheduledAt")) null else item.optString("scheduledAt")
+        )
+    }
 
-            if (!isCommandDue(command, nowMs)) {
-                Log.i(
-                    TAG,
-                    "Skipping scheduled command (not yet time) commandId=${command.id} " +
-                        "scheduledAt=${command.scheduledAt ?: "null"}"
-                )
-                continue
+    private fun rememberProcessedCommandId(commandId: String) {
+        synchronized(processedCommandIds) {
+            if (processedCommandIds.contains(commandId)) {
+                return
             }
+            processedCommandIds.add(commandId)
+            while (processedCommandIds.size > MAX_TRACKED_PROCESSED_COMMAND_IDS) {
+                val iterator = processedCommandIds.iterator()
+                if (!iterator.hasNext()) {
+                    break
+                }
+                iterator.next()
+                iterator.remove()
+            }
+        }
+    }
 
-            val action = resolveAction(command)
+    private fun hasLocalDuplicate(commandId: String): Boolean {
+        if (processedCommandIds.contains(commandId)) {
             Log.i(
                 TAG,
-                "Executing scheduled command commandId=${command.id} action=$action"
+                "background/runtime duplicate command ignored (processed) commandId=$commandId"
             )
-            val success = when (action) {
-                "end" -> dispatchEndCommand(command)
-                "sms" -> dispatchSmsCommand(command)
-                "auto_answer" -> dispatchAutoAnswerCommand(command)
-                else -> dispatchCallCommand(command)
-            }
-            if (success) {
-                executedCommandIds.add(command.id)
-            }
+            return true
+        }
+        if (inFlightCommandIds.contains(commandId)) {
+            Log.i(
+                TAG,
+                "background/runtime duplicate command ignored (in_flight) commandId=$commandId"
+            )
+            return true
+        }
+        return false
+    }
+
+    private fun processClaimedCommand(command: ServerCallCommand?) {
+        if (command == null) {
+            return
+        }
+
+        val commandId = command.id.trim()
+        if (commandId.isBlank()) {
+            Log.w(TAG, "background/runtime claimed command missing id")
+            return
+        }
+
+        if (hasLocalDuplicate(commandId)) {
+            return
+        }
+
+        rememberProcessedCommandId(commandId)
+        val action = resolveAction(command)
+        Log.i(
+            TAG,
+            "background/runtime command selected commandId=$commandId action=$action type=${command.type}"
+        )
+        when (action) {
+            "end" -> dispatchEndCommand(command)
+            "sms" -> dispatchSmsCommand(command)
+            "auto_answer" -> dispatchAutoAnswerCommand(command)
+            else -> dispatchCallCommand(command)
         }
     }
 
@@ -350,6 +384,7 @@ class AutoCallCommandPollingService : Service() {
     private fun dispatchAutoAnswerCommand(command: ServerCallCommand): Boolean {
         inFlightCommandIds.add(command.id)
         try {
+            Log.i(TAG, "background/runtime command execution started commandId=${command.id} action=auto_answer")
             val enabled = command.enabled
             if (enabled == null) {
                 Log.w(
@@ -357,6 +392,7 @@ class AutoCallCommandPollingService : Service() {
                     "background/runtime auto-answer command missing enabled commandId=${command.id}"
                 )
                 updateCommandStatus(command.id, "failed", "AUTO_ANSWER command missing enabled")
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=auto_answer result=failed")
                 return false
             }
 
@@ -370,10 +406,10 @@ class AutoCallCommandPollingService : Service() {
                     "failed",
                     "AUTO_ANSWER permissions missing: ANSWER_PHONE_CALLS/READ_PHONE_STATE"
                 )
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=auto_answer result=failed")
                 return false
             }
 
-            updateCommandStatus(command.id, "executing")
             AutoAnswerController.applyAutoAnswerSettings(
                 context = applicationContext,
                 enabled = enabled,
@@ -389,6 +425,7 @@ class AutoCallCommandPollingService : Service() {
                 "background/runtime auto-answer command executed commandId=${command.id} " +
                     "enabled=$enabled autoHangupSeconds=${command.autoHangupSeconds ?: "null"}"
             )
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=auto_answer result=executed")
             return true
         } catch (error: Throwable) {
             Log.e(
@@ -401,6 +438,7 @@ class AutoCallCommandPollingService : Service() {
                 "failed",
                 error.message ?: "auto_answer_command_crash"
             )
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=auto_answer result=failed")
             return false
         } finally {
             inFlightCommandIds.remove(command.id)
@@ -410,7 +448,7 @@ class AutoCallCommandPollingService : Service() {
     private fun dispatchEndCommand(command: ServerCallCommand): Boolean {
         inFlightCommandIds.add(command.id)
         try {
-            updateCommandStatus(command.id, "executing")
+            Log.i(TAG, "background/runtime command execution started commandId=${command.id} action=end")
             Log.i(
                 TAG,
                 "end command dispatched from background/runtime layer commandId=${command.id}"
@@ -420,6 +458,7 @@ class AutoCallCommandPollingService : Service() {
             if (result.ended) {
                 updateCommandStatus(command.id, "executed")
                 Log.i(TAG, "background/runtime end command executed commandId=${command.id}")
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=end result=executed")
                 return true
             } else {
                 updateCommandStatus(command.id, "failed", result.reason)
@@ -429,11 +468,13 @@ class AutoCallCommandPollingService : Service() {
                         "reason=${result.reason} " +
                         "hasAnswerPhoneCallsPermission=${result.hasAnswerPhoneCallsPermission}"
                 )
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=end result=failed")
                 return false
             }
         } catch (error: Throwable) {
             Log.e(TAG, "background/runtime end command crash commandId=${command.id}", error)
             updateCommandStatus(command.id, "failed", error.message ?: "end_command_crash")
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=end result=failed")
             return false
         } finally {
             inFlightCommandIds.remove(command.id)
@@ -443,14 +484,15 @@ class AutoCallCommandPollingService : Service() {
     private fun dispatchCallCommand(command: ServerCallCommand): Boolean {
         inFlightCommandIds.add(command.id)
         try {
+            Log.i(TAG, "background/runtime command execution started commandId=${command.id} action=call")
             val phoneNumber = command.phoneNumber
             if (phoneNumber.isNullOrBlank()) {
                 Log.w(TAG, "background/runtime call command missing phone commandId=${command.id}")
                 updateCommandStatus(command.id, "failed", "CALL command missing phoneNumber")
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=call result=failed")
                 return false
             }
 
-            updateCommandStatus(command.id, "executing")
             val callResult = SimpleCallManager.startSimpleCall(
                 context = applicationContext,
                 rawPhoneNumber = phoneNumber,
@@ -468,6 +510,7 @@ class AutoCallCommandPollingService : Service() {
                     "background/runtime call command failed commandId=${command.id} " +
                         "reason=${callResult.reason} message=${callResult.message}"
                 )
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=call result=failed")
                 return false
             }
 
@@ -477,10 +520,12 @@ class AutoCallCommandPollingService : Service() {
             )
             updateCommandStatus(command.id, "executed")
             Log.i(TAG, "background/runtime call command executed commandId=${command.id}")
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=call result=executed")
             return true
         } catch (error: Throwable) {
             Log.e(TAG, "background/runtime call command crash commandId=${command.id}", error)
             updateCommandStatus(command.id, "failed", error.message ?: "call_command_crash")
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=call result=failed")
             return false
         } finally {
             inFlightCommandIds.remove(command.id)
@@ -490,10 +535,12 @@ class AutoCallCommandPollingService : Service() {
     private fun dispatchSmsCommand(command: ServerCallCommand): Boolean {
         inFlightCommandIds.add(command.id)
         try {
+            Log.i(TAG, "background/runtime command execution started commandId=${command.id} action=sms")
             val phoneNumber = command.phoneNumber
             if (phoneNumber.isNullOrBlank()) {
                 Log.w(TAG, "background/runtime sms command missing phone commandId=${command.id}")
                 updateCommandStatus(command.id, "failed", "SMS command missing phoneNumber")
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=sms result=failed")
                 return false
             }
 
@@ -501,10 +548,10 @@ class AutoCallCommandPollingService : Service() {
             if (message.isNullOrBlank()) {
                 Log.w(TAG, "background/runtime sms command missing message commandId=${command.id}")
                 updateCommandStatus(command.id, "failed", "SMS command missing message")
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=sms result=failed")
                 return false
             }
 
-            updateCommandStatus(command.id, "executing")
             val smsResult = SimpleSmsManager.sendServerCommandSms(
                 context = applicationContext,
                 rawPhoneNumber = phoneNumber,
@@ -517,11 +564,13 @@ class AutoCallCommandPollingService : Service() {
                     "background/runtime sms command failed commandId=${command.id} " +
                         "reason=${smsResult.reason} message=${smsResult.message}"
                 )
+                Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=sms result=failed")
                 return false
             }
 
             updateCommandStatus(command.id, "executed")
             Log.i(TAG, "background/runtime sms command executed commandId=${command.id}")
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=sms result=executed")
             return true
         } catch (error: AutoCallException) {
             val failureReason = error.message ?: "SEND_SMS permission denied"
@@ -531,10 +580,12 @@ class AutoCallCommandPollingService : Service() {
                     "code=${error.code} message=$failureReason"
             )
             updateCommandStatus(command.id, "failed", failureReason)
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=sms result=failed")
             return false
         } catch (error: Throwable) {
             Log.e(TAG, "background/runtime sms command crash commandId=${command.id}", error)
             updateCommandStatus(command.id, "failed", error.message ?: "sms_command_crash")
+            Log.i(TAG, "background/runtime command execution finished commandId=${command.id} action=sms result=failed")
             return false
         } finally {
             inFlightCommandIds.remove(command.id)
@@ -552,6 +603,10 @@ class AutoCallCommandPollingService : Service() {
                 put("failureReason", failureReason)
             }
         }
+        Log.i(
+            TAG,
+            "background/runtime status update request commandId=$commandId status=$status failureReason=${failureReason ?: "null"}"
+        )
         val result = postJson("$SERVER/commands/$commandId/status", payload)
         if (!result.isSuccessCode()) {
             Log.w(
@@ -559,7 +614,9 @@ class AutoCallCommandPollingService : Service() {
                 "background/runtime update command status failed commandId=$commandId " +
                     "status=$status failureReason=${failureReason ?: "null"} code=${result.code}"
             )
+            return
         }
+        Log.i(TAG, "background/runtime status update success commandId=$commandId status=$status")
     }
 
     private fun parseDurationSeconds(item: JSONObject): Int? {
@@ -649,114 +706,6 @@ class AutoCallCommandPollingService : Service() {
             )
         } catch (error: Throwable) {
             Log.w(TAG, "background/runtime identity sync parse failed", error)
-        }
-    }
-
-    private fun commandSortKey(command: ServerCallCommand): Long {
-        if (command.scheduledAt.isNullOrBlank()) {
-            return 0L
-        }
-        return parseScheduledAtMs(command.scheduledAt) ?: 0L
-    }
-
-    private fun isCommandDue(command: ServerCallCommand, nowMs: Long): Boolean {
-        if (command.scheduledAt.isNullOrBlank()) {
-            return true
-        }
-        val scheduledAtMs = parseScheduledAtMs(command.scheduledAt)
-        if (scheduledAtMs == null) {
-            Log.w(
-                TAG,
-                "Unparseable scheduledAt; executing immediately to avoid stuck command " +
-                    "commandId=${command.id} scheduledAt=${command.scheduledAt}"
-            )
-            return true
-        }
-        return nowMs >= scheduledAtMs
-    }
-
-    private fun parseScheduledAtMs(scheduledAt: String?): Long? {
-        if (scheduledAt.isNullOrBlank()) {
-            return null
-        }
-
-        val raw = scheduledAt.trim()
-        if (raw.isEmpty()) {
-            return null
-        }
-
-        raw.toLongOrNull()?.let { numeric ->
-            return if (raw.length >= 13) {
-                numeric
-            } else {
-                numeric * 1000L
-            }
-        }
-
-        val normalized = raw.replace('\u00A0', ' ')
-        val timezoneAwarePatterns = arrayOf(
-            "yyyy-MM-dd'T'HH:mm:ss.SSSXXX",
-            "yyyy-MM-dd'T'HH:mm:ssXXX",
-            "yyyy-MM-dd'T'HH:mm:ss.SSSX",
-            "yyyy-MM-dd'T'HH:mm:ssX"
-        )
-        for (pattern in timezoneAwarePatterns) {
-            parseWithPattern(normalized, pattern, null)?.let { parsedMs ->
-                return parsedMs
-            }
-        }
-
-        val riyadhTimeZone = TimeZone.getTimeZone(RIYADH_TIMEZONE_ID)
-        val riyadhLocalPatterns = arrayOf(
-            "dd/MM/yyyy, HH:mm:ss",
-            "dd/MM/yyyy HH:mm:ss",
-            "dd/MM/yyyy, HH:mm",
-            "dd/MM/yyyy HH:mm"
-        )
-        for (pattern in riyadhLocalPatterns) {
-            parseWithPattern(normalized, pattern, riyadhTimeZone)?.let { parsedMs ->
-                return parsedMs
-            }
-        }
-
-        return null
-    }
-
-    private fun parseWithPattern(
-        value: String,
-        pattern: String,
-        timeZone: TimeZone?
-    ): Long? {
-        return try {
-            val parser = SimpleDateFormat(pattern, Locale.US).apply {
-                isLenient = false
-                if (timeZone != null) {
-                    this.timeZone = timeZone
-                }
-            }
-            parser.parse(value)?.time
-        } catch (_: Throwable) {
-            null
-        }
-    }
-
-    private fun get(url: String): HttpResult {
-        var connection: HttpURLConnection? = null
-        return try {
-            connection = URL(url).openConnection() as HttpURLConnection
-            connection.requestMethod = "GET"
-            connection.connectTimeout = 10_000
-            connection.readTimeout = 10_000
-            connection.useCaches = false
-
-            val code = connection.responseCode
-            val body = readResponseBody(connection, code)
-            HttpResult(code, body)
-        } catch (error: Throwable) {
-            Log.e(TAG, "runtime GET failed url=$url", error)
-            HttpResult(-1, "")
-        } finally {
-            connection?.disconnect()
         }
     }
 

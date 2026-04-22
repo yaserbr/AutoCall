@@ -20,7 +20,7 @@ import {
   startSimpleCall,
   startServerCommandCall,
   startServerCommandSms,
-} from "../../src/native/autoCallNative";
+} from "../src/native/autoCallNative";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
 const POLL_INTERVAL_MS = 10000;
@@ -29,9 +29,10 @@ const DEFAULT_HANGUP_SECONDS = 20;
 const DEFAULT_SIMPLE_CALL_DURATION_SECONDS = 20;
 const MAX_AUTO_HANGUP_SECONDS = 600;
 const MAX_SIMPLE_CALL_DURATION_SECONDS = 3600;
-const RIYADH_UTC_OFFSET_MS = 3 * 60 * 60 * 1000;
+const MAX_TRACKED_PROCESSED_COMMAND_IDS = 500;
 const LOG_PREFIX = "[AutoCall/UI]";
 const SMS_PERMISSION_DENIED_REASON = "SEND_SMS permission denied";
+const DEVICE_UID_REGEX = /^[a-z0-9]{5}$/;
 
 type ServerCallCommand = {
   id: string;
@@ -51,6 +52,11 @@ type ServerCallCommand = {
 type ServerDevice = {
   deviceUid?: string;
   deviceName?: string | null;
+};
+
+type ClaimNextCommandResponse = {
+  success?: boolean;
+  command?: ServerCallCommand | null;
 };
 
 type UiState = {
@@ -79,6 +85,14 @@ const logEvent = (event: string, payload?: unknown) => {
   console.log(`${LOG_PREFIX} ${event}`);
 };
 
+const normalizeDeviceUid = (value: string | null | undefined): string => {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const normalized = value.trim().toLowerCase();
+  return DEVICE_UID_REGEX.test(normalized) ? normalized : "";
+};
+
 const normalizePhoneNumber = (input: string): string | null => {
   const trimmed = input.trim();
   if (!trimmed) return null;
@@ -105,90 +119,6 @@ const emptyDeviceIdentity: DeviceIdentity = {
   deviceName: "",
 };
 
-const parseScheduledAtMs = (scheduledAt?: string | null): number | null => {
-  if (!scheduledAt) {
-    return null;
-  }
-
-  const trimmed = scheduledAt.trim();
-  if (!trimmed) {
-    return null;
-  }
-
-  if (/^\d+$/.test(trimmed)) {
-    const numeric = Number.parseInt(trimmed, 10);
-    if (!Number.isNaN(numeric)) {
-      return trimmed.length >= 13 ? numeric : numeric * 1000;
-    }
-  }
-
-  const parsedWithNativeDate = Date.parse(trimmed);
-  if (!Number.isNaN(parsedWithNativeDate)) {
-    return parsedWithNativeDate;
-  }
-
-  // Server may return display-formatted values like "20/04/2026, 19:45:00" (Asia/Riyadh).
-  const normalizedForRegex = trimmed.replace(",", "");
-  const match = normalizedForRegex.match(
-    /^(\d{1,2})\/(\d{1,2})\/(\d{4})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/
-  );
-  if (!match) {
-    return null;
-  }
-
-  const [, dayPart, monthPart, yearPart, hourPart, minutePart, secondPart = "0"] = match;
-  const day = Number.parseInt(dayPart, 10);
-  const month = Number.parseInt(monthPart, 10);
-  const year = Number.parseInt(yearPart, 10);
-  const hour = Number.parseInt(hourPart, 10);
-  const minute = Number.parseInt(minutePart, 10);
-  const second = Number.parseInt(secondPart, 10);
-
-  if (
-    Number.isNaN(day) ||
-    Number.isNaN(month) ||
-    Number.isNaN(year) ||
-    Number.isNaN(hour) ||
-    Number.isNaN(minute) ||
-    Number.isNaN(second)
-  ) {
-    return null;
-  }
-
-  if (
-    year < 1970 ||
-    month < 1 ||
-    month > 12 ||
-    day < 1 ||
-    day > 31 ||
-    hour < 0 ||
-    hour > 23 ||
-    minute < 0 ||
-    minute > 59 ||
-    second < 0 ||
-    second > 59
-  ) {
-    return null;
-  }
-
-  const utcMs = Date.UTC(year, month - 1, day, hour, minute, second) - RIYADH_UTC_OFFSET_MS;
-
-  // Validate date rollover (e.g. 31/02) before accepting the parsed value.
-  const validation = new Date(utcMs + RIYADH_UTC_OFFSET_MS);
-  if (
-    validation.getUTCFullYear() !== year ||
-    validation.getUTCMonth() !== month - 1 ||
-    validation.getUTCDate() !== day ||
-    validation.getUTCHours() !== hour ||
-    validation.getUTCMinutes() !== minute ||
-    validation.getUTCSeconds() !== second
-  ) {
-    return null;
-  }
-
-  return utcMs;
-};
-
 export default function AutoCallScreen() {
   const [uiState, setUiState] = useState<UiState>(emptyState);
   const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity>(emptyDeviceIdentity);
@@ -200,7 +130,8 @@ export default function AutoCallScreen() {
   );
   const [nextServerCommand, setNextServerCommand] = useState<ServerCallCommand | null>(null);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
-  const executedCommandIds = useRef<Set<string>>(new Set());
+  const processedCommandIds = useRef<Set<string>>(new Set());
+  const pollInProgressRef = useRef(false);
   const deviceUidRef = useRef<string>("");
   const deviceNameRef = useRef<string>("");
 
@@ -216,7 +147,7 @@ export default function AutoCallScreen() {
   };
 
   const applyDeviceIdentity = (identity: DeviceIdentity) => {
-    const normalizedUid = typeof identity.deviceUid === "string" ? identity.deviceUid.trim() : "";
+    const normalizedUid = normalizeDeviceUid(identity.deviceUid);
     const normalizedName = typeof identity.deviceName === "string" ? identity.deviceName.trim() : "";
 
     deviceUidRef.current = normalizedUid;
@@ -239,12 +170,14 @@ export default function AutoCallScreen() {
   };
 
   const getCurrentDeviceUid = async (): Promise<string | null> => {
-    if (deviceUidRef.current) {
-      return deviceUidRef.current;
+    const cachedUid = normalizeDeviceUid(deviceUidRef.current);
+    if (cachedUid) {
+      deviceUidRef.current = cachedUid;
+      return cachedUid;
     }
 
     const identity = await refreshDeviceIdentity();
-    const normalizedUid = identity?.deviceUid?.trim() ?? "";
+    const normalizedUid = normalizeDeviceUid(identity?.deviceUid);
     return normalizedUid || null;
   };
 
@@ -253,16 +186,13 @@ export default function AutoCallScreen() {
       return;
     }
 
-    const serverUid =
-      typeof device.deviceUid === "string" && device.deviceUid.trim()
-        ? device.deviceUid.trim()
-        : "";
+    const serverUid = normalizeDeviceUid(device.deviceUid);
     if (!serverUid) {
       return;
     }
 
-    const currentUid = deviceUidRef.current || serverUid;
-    if (currentUid && serverUid !== currentUid) {
+    const currentUid = normalizeDeviceUid(deviceUidRef.current);
+    if (!currentUid || serverUid !== currentUid) {
       return;
     }
 
@@ -274,10 +204,10 @@ export default function AutoCallScreen() {
       return;
     }
 
-    deviceUidRef.current = currentUid || serverUid;
+    deviceUidRef.current = currentUid;
     deviceNameRef.current = serverName;
-    setDeviceIdentity((previous) => ({
-      deviceUid: previous.deviceUid || currentUid || serverUid,
+    setDeviceIdentity(() => ({
+      deviceUid: currentUid,
       deviceName: serverName,
     }));
   };
@@ -391,13 +321,89 @@ export default function AutoCallScreen() {
       if (typeof failureReason === "string" && failureReason.trim()) {
         payload.failureReason = failureReason.trim();
       }
-      await fetch(`${SERVER}/commands/${id}/status`, {
+      logEvent("command_status_update_request", {
+        commandId: id,
+        status,
+        failureReason: payload.failureReason ?? null,
+      });
+      const response = await fetch(`${SERVER}/commands/${id}/status`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
       });
+      if (!response.ok) {
+        logEvent("command_status_update_rejected", {
+          commandId: id,
+          status,
+          code: response.status,
+        });
+        return;
+      }
+      logEvent("command_status_update_success", { commandId: id, status });
     } catch (error) {
       logEvent("update_command_status_failed", { id, status, failureReason, error });
+    }
+  };
+
+  const rememberProcessedCommandId = (commandId: string) => {
+    if (!commandId || processedCommandIds.current.has(commandId)) {
+      return;
+    }
+    processedCommandIds.current.add(commandId);
+    while (processedCommandIds.current.size > MAX_TRACKED_PROCESSED_COMMAND_IDS) {
+      const oldest = processedCommandIds.current.values().next().value as string | undefined;
+      if (!oldest) {
+        break;
+      }
+      processedCommandIds.current.delete(oldest);
+    }
+  };
+
+  const hasLocalDuplicate = (commandId: string): boolean => {
+    if (processedCommandIds.current.has(commandId)) {
+      logEvent("command_duplicate_ignored_processed", { commandId });
+      return true;
+    }
+    if (inFlightCommandIds.current.has(commandId)) {
+      logEvent("command_duplicate_ignored_in_flight", { commandId });
+      return true;
+    }
+    return false;
+  };
+
+  const claimNextCommand = async (): Promise<ServerCallCommand | null> => {
+    const deviceUid = await getCurrentDeviceUid();
+    if (!deviceUid) {
+      logEvent("claim_command_skipped_missing_uid");
+      return null;
+    }
+
+    try {
+      logEvent("claim_command_request", { deviceUid });
+      const response = await fetch(`${SERVER}/commands/claim`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ deviceUid }),
+      });
+      if (!response.ok) {
+        logEvent("claim_command_rejected", {
+          deviceUid,
+          code: response.status,
+        });
+        return null;
+      }
+
+      const payload = (await response.json()) as ClaimNextCommandResponse;
+      const command = payload.command ?? null;
+      logEvent("claim_command_result", {
+        deviceUid,
+        commandId: command?.id ?? null,
+        status: command?.status ?? null,
+      });
+      return command;
+    } catch (error) {
+      logEvent("claim_command_failed", { deviceUid, error });
+      return null;
     }
   };
 
@@ -456,7 +462,12 @@ export default function AutoCallScreen() {
     try {
       if (commandId) {
         inFlightCommandIds.current.add(commandId);
-        await updateCommandStatus(commandId, "executing");
+        logEvent("command_execution_started", {
+          commandId,
+          action: "call",
+          source,
+          durationSeconds: commandDurationSeconds ?? null,
+        });
       }
 
       const hasPermissions = await requestAndroidPermissions();
@@ -468,7 +479,7 @@ export default function AutoCallScreen() {
       }
 
       if (source === "server") {
-        logEvent("Outgoing call command received", {
+        logEvent("command_selected_for_execution", {
           phoneNumber: normalized,
           commandId,
           durationSeconds: commandDurationSeconds ?? null,
@@ -493,6 +504,11 @@ export default function AutoCallScreen() {
 
       if (commandId) {
         await updateCommandStatus(commandId, "executed");
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "call",
+          result: "executed",
+        });
       }
 
       setStatusMessage(source === "server" ? "Outgoing call started from server command" : "Outgoing call started");
@@ -501,6 +517,11 @@ export default function AutoCallScreen() {
       logEvent("execute_outgoing_call_failed", { error, source, commandId, rawPhoneNumber });
       if (commandId) {
         await updateCommandStatus(commandId, "failed");
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "call",
+          result: "failed",
+        });
       }
       setStatusMessage("Failed to start outgoing call");
       return false;
@@ -514,23 +535,37 @@ export default function AutoCallScreen() {
   const executeEndCommand = async (commandId: string): Promise<boolean> => {
     try {
       inFlightCommandIds.current.add(commandId);
-      await updateCommandStatus(commandId, "executing");
-      console.log("End command received");
+      logEvent("command_execution_started", { commandId, action: "end" });
       const result = await endCurrentCall();
       await refreshStatus();
 
       if (result.ended) {
         await updateCommandStatus(commandId, "executed");
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "end",
+          result: "executed",
+        });
         setStatusMessage("Current call ended from server command");
         return true;
       }
 
       await updateCommandStatus(commandId, "failed");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "end",
+        result: "failed",
+      });
       setStatusMessage("Could not end current call from server command");
       return false;
     } catch (error) {
       logEvent("execute_end_command_failed", { error, commandId });
       await updateCommandStatus(commandId, "failed");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "end",
+        result: "failed",
+      });
       setStatusMessage("Failed to execute end command");
       return false;
     } finally {
@@ -559,13 +594,18 @@ export default function AutoCallScreen() {
 
     try {
       inFlightCommandIds.current.add(commandId);
-      await updateCommandStatus(commandId, "executing");
+      logEvent("command_execution_started", { commandId, action: "sms" });
 
       const hasPermissions = await requestAndroidPermissions([
         PermissionsAndroid.PERMISSIONS.SEND_SMS,
       ]);
       if (!hasPermissions) {
         await updateCommandStatus(commandId, "failed", SMS_PERMISSION_DENIED_REASON);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "sms",
+          result: "failed",
+        });
         setStatusMessage(`SMS command failed: ${SMS_PERMISSION_DENIED_REASON}`);
         return false;
       }
@@ -575,16 +615,31 @@ export default function AutoCallScreen() {
         const failureReason =
           smsResult.reason === "permission_denied" ? SMS_PERMISSION_DENIED_REASON : smsResult.message;
         await updateCommandStatus(commandId, "failed", failureReason);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "sms",
+          result: "failed",
+        });
         setStatusMessage(`SMS command failed: ${failureReason}`);
         return false;
       }
 
       await updateCommandStatus(commandId, "executed");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "sms",
+        result: "executed",
+      });
       setStatusMessage("SMS sent from server command");
       return true;
     } catch (error) {
       logEvent("execute_sms_command_failed", { error, commandId });
       await updateCommandStatus(commandId, "failed", "Failed to send SMS");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "sms",
+        result: "failed",
+      });
       setStatusMessage("Failed to execute SMS command");
       return false;
     } finally {
@@ -596,10 +651,15 @@ export default function AutoCallScreen() {
     const commandId = command.id;
     try {
       inFlightCommandIds.current.add(commandId);
-      await updateCommandStatus(commandId, "executing");
+      logEvent("command_execution_started", { commandId, action: "auto_answer" });
 
       if (typeof command.enabled !== "boolean") {
         await updateCommandStatus(commandId, "failed", "AUTO_ANSWER command missing enabled");
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "auto_answer",
+          result: "failed",
+        });
         setStatusMessage("AUTO_ANSWER command missing enabled");
         return false;
       }
@@ -608,6 +668,11 @@ export default function AutoCallScreen() {
         const hasPermissions = await requestAndroidPermissions();
         if (!hasPermissions) {
           await updateCommandStatus(commandId, "failed", "Missing required phone permissions");
+          logEvent("command_execution_finished", {
+            commandId,
+            action: "auto_answer",
+            result: "failed",
+          });
           setStatusMessage("AUTO_ANSWER failed: missing required phone permissions");
           return false;
         }
@@ -621,6 +686,11 @@ export default function AutoCallScreen() {
             "failed",
             "AUTO_ANSWER command has invalid autoHangupSeconds"
           );
+          logEvent("command_execution_finished", {
+            commandId,
+            action: "auto_answer",
+            result: "failed",
+          });
           setStatusMessage("AUTO_ANSWER command has invalid autoHangupSeconds");
           return false;
         }
@@ -630,6 +700,11 @@ export default function AutoCallScreen() {
         const status = await enableAutoAnswer(requestedSeconds);
         updateUiFromStatus(status);
         await updateCommandStatus(commandId, "executed");
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "auto_answer",
+          result: "executed",
+        });
         setStatusMessage(`Auto Answer ON (${status.autoHangupSeconds}s) from server command`);
         return true;
       }
@@ -637,11 +712,21 @@ export default function AutoCallScreen() {
       const status = await disableAutoAnswer();
       updateUiFromStatus(status);
       await updateCommandStatus(commandId, "executed");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "auto_answer",
+        result: "executed",
+      });
       setStatusMessage("Auto Answer OFF from server command");
       return true;
     } catch (error) {
       logEvent("execute_auto_answer_command_failed", { error, commandId, command });
       await updateCommandStatus(commandId, "failed", "Failed to apply AUTO_ANSWER command");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "auto_answer",
+        result: "failed",
+      });
       setStatusMessage("Failed to execute AUTO_ANSWER command");
       return false;
     } finally {
@@ -649,132 +734,90 @@ export default function AutoCallScreen() {
     }
   };
 
-  const getScheduledAtMs = (command: ServerCallCommand): number | null => {
-    return parseScheduledAtMs(command.scheduledAt ?? null);
-  };
-
-  const getCommandSortKey = (command: ServerCallCommand): number => {
-    const scheduledAtMs = getScheduledAtMs(command);
-    return scheduledAtMs ?? 0;
-  };
-
-  const isCommandDueNow = (command: ServerCallCommand, nowMs: number): boolean => {
-    if (!command.scheduledAt) {
-      return true;
+  const resolveCommandAction = (
+    command: ServerCallCommand
+  ): "call" | "end" | "sms" | "auto_answer" => {
+    const explicitAction = command.action;
+    if (explicitAction === "call" || explicitAction === "end" || explicitAction === "sms" || explicitAction === "auto_answer") {
+      return explicitAction;
     }
-    const scheduledAtMs = getScheduledAtMs(command);
-    if (scheduledAtMs === null) {
-      logEvent("Unparseable scheduledAt; executing immediately to avoid stuck command", {
-        commandId: command.id,
-        scheduledAt: command.scheduledAt,
-      });
-      return true;
-    }
-    return nowMs >= scheduledAtMs;
+
+    if (command.type === "END") return "end";
+    if (command.type === "SMS") return "sms";
+    if (command.type === "AUTO_ANSWER") return "auto_answer";
+    return "call";
   };
 
   const pollCommands = async () => {
+    if (pollInProgressRef.current) {
+      logEvent("poll_commands_skipped_already_running");
+      return;
+    }
+
+    pollInProgressRef.current = true;
     try {
-      const deviceUid = await getCurrentDeviceUid();
-      if (!deviceUid) {
-        logEvent("poll_commands_skipped_missing_uid");
+      const command = await claimNextCommand();
+      setNextServerCommand(command);
+      if (!command) {
         return;
       }
 
-      const encodedUid = encodeURIComponent(deviceUid);
-      const response = await fetch(`${SERVER}/commands?deviceUid=${encodedUid}&status=pending`);
-      if (!response.ok) return;
-
-      const commands = (await response.json()) as ServerCallCommand[];
-      const dueCommands = [...commands].sort((a, b) => getCommandSortKey(a) - getCommandSortKey(b));
-
-      setNextServerCommand(dueCommands[0] ?? null);
-
-      for (const command of dueCommands) {
-        if (executedCommandIds.current.has(command.id)) {
-          logEvent("Already executed, skipping", { commandId: command.id });
-          continue;
-        }
-        if (inFlightCommandIds.current.has(command.id)) continue;
-        if (!isCommandDueNow(command, Date.now())) {
-          logEvent("Skipping scheduled command (not yet time)", {
-            commandId: command.id,
-            scheduledAt: command.scheduledAt ?? null,
-          });
-          continue;
-        }
-
-        const action =
-          command.action ??
-          (
-            command.type === "END"
-              ? "end"
-              : command.type === "SMS"
-                ? "sms"
-                : command.type === "AUTO_ANSWER"
-                  ? "auto_answer"
-                  : "call"
-          );
-        logEvent("Executing scheduled command", {
-          commandId: command.id,
-          action,
-          scheduledAt: command.scheduledAt ?? null,
-        });
-
-        if (action === "end") {
-          const ended = await executeEndCommand(command.id);
-          if (ended) {
-            executedCommandIds.current.add(command.id);
-          }
-          continue;
-        }
-
-        if (action === "auto_answer") {
-          const applied = await executeAutoAnswerCommand(command);
-          if (applied) {
-            executedCommandIds.current.add(command.id);
-          }
-          continue;
-        }
-
-        if (action === "sms") {
-          if (!command.phoneNumber) {
-            await updateCommandStatus(command.id, "failed", "SMS command missing phoneNumber");
-            continue;
-          }
-          if (!command.message) {
-            await updateCommandStatus(command.id, "failed", "SMS command missing message");
-            continue;
-          }
-
-          const smsSent = await executeSmsCommand(
-            command.phoneNumber,
-            command.message,
-            command.id
-          );
-          if (smsSent) {
-            executedCommandIds.current.add(command.id);
-          }
-          continue;
-        }
-
-        if (!command.phoneNumber) {
-          await updateCommandStatus(command.id, "failed", "CALL command missing phoneNumber");
-          continue;
-        }
-
-        const callStarted = await executeOutgoingCall(
-          command.phoneNumber,
-          "server",
-          command.id,
-          command.durationSeconds ?? null
-        );
-        if (callStarted) {
-          executedCommandIds.current.add(command.id);
-        }
+      const commandId = typeof command.id === "string" ? command.id.trim() : "";
+      if (!commandId) {
+        logEvent("claim_command_invalid_id", { command });
+        return;
       }
+
+      if (hasLocalDuplicate(commandId)) {
+        return;
+      }
+      rememberProcessedCommandId(commandId);
+
+      const action = resolveCommandAction(command);
+      logEvent("command_selected_for_execution", {
+        commandId,
+        action,
+        type: command.type,
+      });
+
+      if (action === "end") {
+        await executeEndCommand(commandId);
+        return;
+      }
+
+      if (action === "auto_answer") {
+        await executeAutoAnswerCommand(command);
+        return;
+      }
+
+      if (action === "sms") {
+        if (!command.phoneNumber) {
+          await updateCommandStatus(commandId, "failed", "SMS command missing phoneNumber");
+          return;
+        }
+        if (!command.message) {
+          await updateCommandStatus(commandId, "failed", "SMS command missing message");
+          return;
+        }
+        await executeSmsCommand(command.phoneNumber, command.message, commandId);
+        return;
+      }
+
+      if (!command.phoneNumber) {
+        await updateCommandStatus(commandId, "failed", "CALL command missing phoneNumber");
+        return;
+      }
+
+      await executeOutgoingCall(
+        command.phoneNumber,
+        "server",
+        commandId,
+        command.durationSeconds ?? null
+      );
     } catch (error) {
       logEvent("poll_commands_failed", { error });
+    } finally {
+      pollInProgressRef.current = false;
     }
   };
 
@@ -917,46 +960,6 @@ export default function AutoCallScreen() {
           </View>
         </View>
 
-        <View style={styles.section}>
-          <Text style={styles.label}>Phone Number</Text>
-          <TextInput
-            value={phoneNumber}
-            onChangeText={setPhoneNumber}
-            keyboardType="phone-pad"
-            autoCorrect={false}
-            autoCapitalize="none"
-            selectionColor="#ffffff"
-            cursorColor="#ffffff"
-            underlineColorAndroid="transparent"
-            style={[styles.input, styles.fullInput, styles.visibleInput]}
-            placeholder="05xxxxxxxx"
-            placeholderTextColor="#8ca0bf"
-          />
-          <Text style={[styles.label, styles.durationLabel]}>Call Duration (seconds)</Text>
-          <TextInput
-            value={simpleCallDurationSecondsText}
-            onChangeText={setSimpleCallDurationSecondsText}
-            keyboardType="number-pad"
-            autoCorrect={false}
-            autoCapitalize="none"
-            selectionColor="#ffffff"
-            cursorColor="#ffffff"
-            underlineColorAndroid="transparent"
-            style={[styles.input, styles.fullInput, styles.visibleInput]}
-            placeholder="5"
-            placeholderTextColor="#8ca0bf"
-          />
-          <Text style={styles.helperText}>Call duration starts from the moment the call begins.</Text>
-
-          <View style={styles.row}>
-            <Pressable style={styles.primaryButton} onPress={onCallNow}>
-              <Text style={styles.primaryButtonText}>Call Now</Text>
-            </Pressable>
-            <Pressable style={styles.dangerButton} onPress={onEndCurrentCall}>
-              <Text style={styles.dangerButtonText}>End Current Call</Text>
-            </Pressable>
-          </View>
-        </View>
 
         <View style={styles.statusBox}>
           <Text style={styles.statusLine}>Device UID: {deviceIdentity.deviceUid || "--"}</Text>
@@ -1115,4 +1118,3 @@ const styles = StyleSheet.create({
     fontWeight: "600",
   },
 });
-
