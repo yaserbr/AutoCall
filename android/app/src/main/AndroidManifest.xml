@@ -47,5 +47,11 @@
       android:enabled="true"
       android:exported="false"
       android:foregroundServiceType="dataSync" />
+    <activity
+      android:name=".InAppWebViewActivity"
+      android:exported="false"
+      android:launchMode="singleTask"
+      android:screenOrientation="portrait"
+      android:theme="@style/AppTheme" />
   </application>
 </manifest>

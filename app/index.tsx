@@ -12,11 +12,15 @@ import {
 import {
   type AutoAnswerStatus,
   type DeviceIdentity,
+  type InAppWebViewState,
+  closeInAppWebView,
   disableAutoAnswer,
   getDeviceIdentity,
+  getInAppWebViewState,
   enableAutoAnswer,
   endCurrentCall,
   getStatus,
+  openInAppWebView,
   startSimpleCall,
   startServerCommandCall,
   startServerCommandSms,
@@ -37,10 +41,11 @@ const DEVICE_UID_REGEX = /^[a-z0-9]{5}$/;
 type ServerCallCommand = {
   id: string;
   deviceUid: string;
-  action?: "call" | "end" | "sms" | "auto_answer";
-  type: "CALL" | "END" | "SMS" | "AUTO_ANSWER";
+  action?: "call" | "end" | "sms" | "auto_answer" | "open_url" | "close_webview";
+  type: "CALL" | "END" | "SMS" | "AUTO_ANSWER" | "OPEN_URL" | "CLOSE_WEBVIEW";
   phoneNumber?: string | null;
   message?: string | null;
+  url?: string | null;
   durationSeconds?: number | null;
   enabled?: boolean | null;
   autoHangupSeconds?: number | null;
@@ -68,6 +73,13 @@ type UiState = {
 };
 type AndroidPermission =
   (typeof PermissionsAndroid.PERMISSIONS)[keyof typeof PermissionsAndroid.PERMISSIONS];
+type ServerCommandAction =
+  | "call"
+  | "end"
+  | "sms"
+  | "auto_answer"
+  | "open_url"
+  | "close_webview";
 
 const emptyState: UiState = {
   autoAnswerEnabled: false,
@@ -75,6 +87,11 @@ const emptyState: UiState = {
   hangupScheduled: false,
   lastEvent: "Idle",
   lastEventAt: 0,
+};
+
+const emptyInAppWebViewState: InAppWebViewState = {
+  isOpen: false,
+  currentUrl: null,
 };
 
 const logEvent = (event: string, payload?: unknown) => {
@@ -109,6 +126,25 @@ const normalizePhoneNumber = (input: string): string | null => {
   return normalized;
 };
 
+const normalizeHttpUrl = (input: string | null | undefined): string | null => {
+  if (typeof input !== "string") {
+    return null;
+  }
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return null;
+  }
+  try {
+    const parsed = new URL(trimmed);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return null;
+    }
+    return parsed.toString();
+  } catch {
+    return null;
+  }
+};
+
 const formatTime = (timestamp: number): string => {
   if (!timestamp) return "--";
   return new Date(timestamp).toLocaleString();
@@ -129,6 +165,7 @@ export default function AutoCallScreen() {
     String(DEFAULT_SIMPLE_CALL_DURATION_SECONDS)
   );
   const [nextServerCommand, setNextServerCommand] = useState<ServerCallCommand | null>(null);
+  const [webViewState, setWebViewState] = useState<InAppWebViewState>(emptyInAppWebViewState);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
   const processedCommandIds = useRef<Set<string>>(new Set());
   const pollInProgressRef = useRef(false);
@@ -220,6 +257,16 @@ export default function AutoCallScreen() {
     } catch (error) {
       logEvent("status_refresh_failed", { error });
       setStatusMessage("Failed to load auto-answer status");
+    }
+  };
+
+  const refreshInAppWebViewState = async () => {
+    try {
+      const snapshot = await getInAppWebViewState();
+      setWebViewState(snapshot);
+      logEvent("webview_state_refresh", snapshot);
+    } catch (error) {
+      logEvent("webview_state_refresh_failed", { error });
     }
   };
 
@@ -734,17 +781,168 @@ export default function AutoCallScreen() {
     }
   };
 
+  const executeOpenUrlCommand = async (
+    commandId: string,
+    rawUrl: string | null | undefined
+  ): Promise<boolean> => {
+    const normalizedUrl = normalizeHttpUrl(rawUrl);
+    if (!normalizedUrl) {
+      await updateCommandStatus(commandId, "failed", "OPEN_URL command has invalid url");
+      setStatusMessage("OPEN_URL command failed: invalid URL");
+      logEvent("open_url_invalid", { commandId, rawUrl });
+      return false;
+    }
+
+    try {
+      inFlightCommandIds.current.add(commandId);
+      logEvent("command_execution_started", {
+        commandId,
+        action: "open_url",
+        url: normalizedUrl,
+      });
+      logEvent("open_url_received", { commandId, url: normalizedUrl });
+
+      const result = await openInAppWebView(normalizedUrl);
+      setWebViewState({
+        isOpen: result.isOpen,
+        currentUrl: result.currentUrl,
+      });
+
+      if (!result.success) {
+        await updateCommandStatus(
+          commandId,
+          "failed",
+          result.message || "Failed to open in-app WebView"
+        );
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "open_url",
+          result: "failed",
+          reason: result.reason,
+        });
+        setStatusMessage(`OPEN_URL failed: ${result.message}`);
+        return false;
+      }
+
+      if (result.replacedExisting) {
+        logEvent("webview_url_replaced", {
+          commandId,
+          url: result.url ?? normalizedUrl,
+        });
+      } else {
+        logEvent("webview_opened", {
+          commandId,
+          url: result.url ?? normalizedUrl,
+        });
+      }
+
+      await updateCommandStatus(commandId, "executed");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "open_url",
+        result: "executed",
+        replacedExisting: result.replacedExisting,
+      });
+      setStatusMessage(
+        result.replacedExisting
+          ? "WebView URL replaced from server command"
+          : "WebView opened from server command"
+      );
+      return true;
+    } catch (error) {
+      logEvent("execute_open_url_command_failed", { error, commandId, rawUrl });
+      await updateCommandStatus(commandId, "failed", "Failed to execute OPEN_URL command");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "open_url",
+        result: "failed",
+      });
+      setStatusMessage("Failed to execute OPEN_URL command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
+  const executeCloseWebViewCommand = async (commandId: string): Promise<boolean> => {
+    try {
+      inFlightCommandIds.current.add(commandId);
+      logEvent("command_execution_started", { commandId, action: "close_webview" });
+      logEvent("close_webview_received", { commandId });
+
+      const result = await closeInAppWebView();
+      setWebViewState({
+        isOpen: result.isOpen,
+        currentUrl: result.currentUrl,
+      });
+
+      if (!result.success) {
+        await updateCommandStatus(
+          commandId,
+          "failed",
+          result.message || "Failed to close in-app WebView"
+        );
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "close_webview",
+          result: "failed",
+          reason: result.reason,
+        });
+        setStatusMessage(`CLOSE_WEBVIEW failed: ${result.message}`);
+        return false;
+      }
+
+      await updateCommandStatus(commandId, "executed");
+      if (result.noOp) {
+        logEvent("close_webview_ignored_no_active_webview", { commandId });
+        setStatusMessage("CLOSE_WEBVIEW applied (no active WebView)");
+      } else {
+        logEvent("webview_closed", { commandId });
+        setStatusMessage("WebView closed from server command");
+      }
+
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "close_webview",
+        result: "executed",
+        noOp: result.noOp,
+      });
+      return true;
+    } catch (error) {
+      logEvent("execute_close_webview_command_failed", { error, commandId });
+      await updateCommandStatus(commandId, "failed", "Failed to execute CLOSE_WEBVIEW command");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "close_webview",
+        result: "failed",
+      });
+      setStatusMessage("Failed to execute CLOSE_WEBVIEW command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
   const resolveCommandAction = (
     command: ServerCallCommand
-  ): "call" | "end" | "sms" | "auto_answer" => {
+  ): ServerCommandAction => {
     const explicitAction = command.action;
-    if (explicitAction === "call" || explicitAction === "end" || explicitAction === "sms" || explicitAction === "auto_answer") {
+    if (
+      explicitAction === "call" ||
+      explicitAction === "end" ||
+      explicitAction === "sms" ||
+      explicitAction === "auto_answer" ||
+      explicitAction === "open_url" ||
+      explicitAction === "close_webview"
+    ) {
       return explicitAction;
     }
 
     if (command.type === "END") return "end";
     if (command.type === "SMS") return "sms";
     if (command.type === "AUTO_ANSWER") return "auto_answer";
+    if (command.type === "OPEN_URL") return "open_url";
+    if (command.type === "CLOSE_WEBVIEW") return "close_webview";
     return "call";
   };
 
@@ -787,6 +985,20 @@ export default function AutoCallScreen() {
 
       if (action === "auto_answer") {
         await executeAutoAnswerCommand(command);
+        return;
+      }
+
+      if (action === "open_url") {
+        if (!command.url) {
+          await updateCommandStatus(commandId, "failed", "OPEN_URL command missing url");
+          return;
+        }
+        await executeOpenUrlCommand(commandId, command.url);
+        return;
+      }
+
+      if (action === "close_webview") {
+        await executeCloseWebViewCommand(commandId);
         return;
       }
 
@@ -835,6 +1047,15 @@ export default function AutoCallScreen() {
         return "AUTO_ANSWER OFF";
       }
       return "AUTO_ANSWER";
+    }
+
+    if (command.type === "OPEN_URL") {
+      const normalizedUrl = normalizeHttpUrl(command.url);
+      return normalizedUrl ? `OPEN_URL (${normalizedUrl})` : "OPEN_URL";
+    }
+
+    if (command.type === "CLOSE_WEBVIEW") {
+      return "CLOSE_WEBVIEW";
     }
 
     return `${command.type}${command.phoneNumber ? ` (${command.phoneNumber})` : ""}`;
@@ -905,6 +1126,7 @@ export default function AutoCallScreen() {
       await requestAndroidPermissions();
       await refreshDeviceIdentity();
       await refreshStatus();
+      await refreshInAppWebViewState();
       await registerDevice();
       await sendHeartbeat();
       await pollCommands();
@@ -919,6 +1141,7 @@ export default function AutoCallScreen() {
 
       statusTimer = setInterval(() => {
         void refreshStatus();
+        void refreshInAppWebViewState();
       }, 3000);
     };
 
@@ -972,6 +1195,10 @@ export default function AutoCallScreen() {
           <Text style={styles.statusLine}>
             Next Server Command:{" "}
             {formatNextServerCommand(nextServerCommand)}
+          </Text>
+          <Text style={styles.statusLine}>WebView Open: {webViewState.isOpen ? "YES" : "NO"}</Text>
+          <Text style={styles.statusLine}>
+            WebView URL: {webViewState.currentUrl ? webViewState.currentUrl : "--"}
           </Text>
           <Text style={styles.statusMessage}>{statusMessage}</Text>
         </View>

@@ -13,6 +13,23 @@ export type DeviceIdentity = {
   deviceName: string;
 };
 
+export type InAppWebViewState = {
+  isOpen: boolean;
+  currentUrl: string | null;
+};
+
+type InAppWebViewCommandResult = {
+  success: boolean;
+  reason: string;
+  message: string;
+  url: string | null;
+  replacedExisting: boolean;
+  closed: boolean;
+  noOp: boolean;
+  isOpen: boolean;
+  currentUrl: string | null;
+};
+
 type OutgoingCallResult = {
   action: string;
   phoneNumber: string;
@@ -49,6 +66,9 @@ type AutoCallNativeModule = {
   getAutoAnswerStatus(): Promise<AutoAnswerStatus>;
   getDeviceIdentity(): Promise<DeviceIdentity>;
   endCurrentCall(): Promise<{ ended: boolean }>;
+  openInAppWebView(url: string): Promise<InAppWebViewCommandResult>;
+  closeInAppWebView(): Promise<InAppWebViewCommandResult>;
+  getInAppWebViewState(): Promise<InAppWebViewState>;
 };
 
 const getNativeModule = (): AutoCallNativeModule => {
@@ -82,3 +102,9 @@ export const getDeviceIdentity = () => getNativeModule().getDeviceIdentity();
 export const endCurrentCall = async () => {
   return getNativeModule().endCurrentCall();
 };
+
+export const openInAppWebView = (url: string) => getNativeModule().openInAppWebView(url);
+
+export const closeInAppWebView = () => getNativeModule().closeInAppWebView();
+
+export const getInAppWebViewState = () => getNativeModule().getInAppWebViewState();

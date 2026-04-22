@@ -57,6 +57,7 @@ class AutoCallCommandPollingService : Service() {
         val type: String,
         val phoneNumber: String?,
         val message: String?,
+        val url: String?,
         val durationSeconds: Int?,
         val enabled: Boolean?,
         val autoHangupSeconds: Int?,
@@ -297,6 +298,7 @@ class AutoCallCommandPollingService : Service() {
             } else {
                 item.optString("message").takeIf { value -> value.isNotBlank() }
             },
+            url = parseUrl(item),
             durationSeconds = parseDurationSeconds(item),
             enabled = parseAutoAnswerEnabled(item),
             autoHangupSeconds = parseAutoHangupSeconds(item),
@@ -364,6 +366,8 @@ class AutoCallCommandPollingService : Service() {
             "end" -> dispatchEndCommand(command)
             "sms" -> dispatchSmsCommand(command)
             "auto_answer" -> dispatchAutoAnswerCommand(command)
+            "open_url" -> dispatchOpenUrlCommand(command)
+            "close_webview" -> dispatchCloseWebViewCommand(command)
             else -> dispatchCallCommand(command)
         }
     }
@@ -371,12 +375,21 @@ class AutoCallCommandPollingService : Service() {
     private fun resolveAction(command: ServerCallCommand): String {
         val explicitAction = command.action?.lowercase(Locale.US)
         if (!explicitAction.isNullOrBlank()) {
-            return explicitAction
+            when (explicitAction) {
+                "call",
+                "end",
+                "sms",
+                "auto_answer",
+                "open_url",
+                "close_webview" -> return explicitAction
+            }
         }
         return when {
             command.type.equals("END", ignoreCase = true) -> "end"
             command.type.equals("SMS", ignoreCase = true) -> "sms"
             command.type.equals("AUTO_ANSWER", ignoreCase = true) -> "auto_answer"
+            command.type.equals("OPEN_URL", ignoreCase = true) -> "open_url"
+            command.type.equals("CLOSE_WEBVIEW", ignoreCase = true) -> "close_webview"
             else -> "call"
         }
     }
@@ -592,6 +605,135 @@ class AutoCallCommandPollingService : Service() {
         }
     }
 
+    private fun dispatchOpenUrlCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=open_url"
+            )
+
+            val rawUrl = command.url
+            if (rawUrl.isNullOrBlank()) {
+                updateCommandStatus(command.id, "failed", "OPEN_URL command missing url")
+                Log.w(
+                    TAG,
+                    "background/runtime OPEN_URL command missing url commandId=${command.id}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=open_url result=failed"
+                )
+                return false
+            }
+
+            Log.i(
+                TAG,
+                "background/runtime OPEN_URL command received commandId=${command.id} url=$rawUrl"
+            )
+            val result = InAppWebViewController.openUrl(
+                context = applicationContext,
+                rawUrl = rawUrl
+            )
+            if (!result.success) {
+                updateCommandStatus(command.id, "failed", result.message)
+                Log.w(
+                    TAG,
+                    "background/runtime OPEN_URL command failed commandId=${command.id} " +
+                        "reason=${result.reason} message=${result.message}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=open_url result=failed"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            Log.i(
+                TAG,
+                "background/runtime OPEN_URL command executed commandId=${command.id} " +
+                    "url=${result.url ?: "null"} replacedExisting=${result.replacedExisting}"
+            )
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=open_url result=executed"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(TAG, "background/runtime OPEN_URL command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", error.message ?: "open_url_command_crash")
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=open_url result=failed"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
+    private fun dispatchCloseWebViewCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=close_webview"
+            )
+            Log.i(
+                TAG,
+                "background/runtime CLOSE_WEBVIEW command received commandId=${command.id}"
+            )
+
+            val result = InAppWebViewController.closeWebView(applicationContext)
+            if (!result.success) {
+                updateCommandStatus(command.id, "failed", result.message)
+                Log.w(
+                    TAG,
+                    "background/runtime CLOSE_WEBVIEW command failed commandId=${command.id} " +
+                        "reason=${result.reason} message=${result.message}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=close_webview result=failed"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            if (result.noOp) {
+                Log.i(
+                    TAG,
+                    "background/runtime CLOSE_WEBVIEW no-op commandId=${command.id} no active webview"
+                )
+            } else {
+                Log.i(
+                    TAG,
+                    "background/runtime CLOSE_WEBVIEW command executed commandId=${command.id}"
+                )
+            }
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=close_webview result=executed"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(
+                TAG,
+                "background/runtime CLOSE_WEBVIEW command crash commandId=${command.id}",
+                error
+            )
+            updateCommandStatus(command.id, "failed", error.message ?: "close_webview_command_crash")
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=close_webview result=failed"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
     private fun updateCommandStatus(
         commandId: String,
         status: String,
@@ -669,6 +811,13 @@ class AutoCallCommandPollingService : Service() {
             return null
         }
         return normalized.coerceAtMost(MAX_AUTO_HANGUP_SECONDS)
+    }
+
+    private fun parseUrl(item: JSONObject): String? {
+        if (item.isNull("url")) {
+            return null
+        }
+        return item.optString("url").takeIf { value -> value.isNotBlank() }
     }
 
     private fun hasAutoAnswerPermissions(): Boolean {

@@ -325,6 +325,44 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    @ReactMethod
+    fun openInAppWebView(url: String, promise: Promise) {
+        try {
+            Log.i(TAG, "OPEN_URL received in native module url=$url")
+            val result = InAppWebViewController.openUrl(
+                context = reactContext,
+                rawUrl = url
+            )
+            promise.resolve(buildWebViewCommandResultMap(result))
+        } catch (error: Throwable) {
+            Log.e(TAG, "openInAppWebView failed", error)
+            promise.reject("E_OPEN_WEBVIEW_FAILED", error.message, error)
+        }
+    }
+
+    @ReactMethod
+    fun closeInAppWebView(promise: Promise) {
+        try {
+            Log.i(TAG, "CLOSE_WEBVIEW received in native module")
+            val result = InAppWebViewController.closeWebView(reactContext)
+            promise.resolve(buildWebViewCommandResultMap(result))
+        } catch (error: Throwable) {
+            Log.e(TAG, "closeInAppWebView failed", error)
+            promise.reject("E_CLOSE_WEBVIEW_FAILED", error.message, error)
+        }
+    }
+
+    @ReactMethod
+    fun getInAppWebViewState(promise: Promise) {
+        try {
+            val snapshot = InAppWebViewController.snapshot()
+            promise.resolve(buildWebViewStateMap(snapshot))
+        } catch (error: Throwable) {
+            Log.e(TAG, "getInAppWebViewState failed", error)
+            promise.reject("E_GET_WEBVIEW_STATE_FAILED", error.message, error)
+        }
+    }
+
     private fun buildStatusMap() = Arguments.createMap().apply {
         val snapshot = AutoAnswerStore.snapshot(reactContext)
         putBoolean("enabled", snapshot.enabled)
@@ -344,4 +382,35 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         }
         return normalized.coerceAtMost(MAX_SERVER_CALL_DURATION_SECONDS)
     }
+
+    private fun buildWebViewStateMap(snapshot: InAppWebViewController.WebViewState) =
+        Arguments.createMap().apply {
+            putBoolean("isOpen", snapshot.isOpen)
+            if (snapshot.currentUrl != null) {
+                putString("currentUrl", snapshot.currentUrl)
+            } else {
+                putNull("currentUrl")
+            }
+        }
+
+    private fun buildWebViewCommandResultMap(result: InAppWebViewController.WebViewCommandResult) =
+        Arguments.createMap().apply {
+            putBoolean("success", result.success)
+            putString("reason", result.reason)
+            putString("message", result.message)
+            if (result.url != null) {
+                putString("url", result.url)
+            } else {
+                putNull("url")
+            }
+            putBoolean("replacedExisting", result.replacedExisting)
+            putBoolean("closed", result.closed)
+            putBoolean("noOp", result.noOp)
+            putBoolean("isOpen", result.state.isOpen)
+            if (result.state.currentUrl != null) {
+                putString("currentUrl", result.state.currentUrl)
+            } else {
+                putNull("currentUrl")
+            }
+        }
 }
