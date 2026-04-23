@@ -363,6 +363,42 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
+    @ReactMethod
+    fun openInstalledApp(appName: String, resolvedPackageName: String?, promise: Promise) {
+        Log.i(
+            TAG,
+            "OPEN_APP received in native module appName=$appName resolvedPackageName=${resolvedPackageName ?: "null"}"
+        )
+        UiThreadUtil.runOnUiThread {
+            try {
+                val result = InstalledAppLauncher.openApp(
+                    context = reactContext,
+                    appName = appName,
+                    resolvedPackageName = resolvedPackageName
+                )
+                promise.resolve(buildOpenAppResultMap(result))
+            } catch (error: Throwable) {
+                Log.e(TAG, "openInstalledApp failed", error)
+                promise.reject("E_OPEN_APP_FAILED", error.message, error)
+            }
+        }
+    }
+
+    @ReactMethod
+    fun returnToAutoCall(promise: Promise) {
+        Log.i(TAG, "RETURN_TO_AUTOCALL received in native module")
+        try {
+            val result = AutoCallAppNavigator.returnToAutoCall(
+                context = reactContext,
+                currentActivity = reactContext.currentActivity
+            )
+            promise.resolve(buildReturnToAutoCallResultMap(result))
+        } catch (error: Throwable) {
+            Log.e(TAG, "returnToAutoCall failed", error)
+            promise.reject("E_RETURN_TO_AUTOCALL_FAILED", error.message, error)
+        }
+    }
+
     private fun buildStatusMap() = Arguments.createMap().apply {
         val snapshot = AutoAnswerStore.snapshot(reactContext)
         putBoolean("enabled", snapshot.enabled)
@@ -412,5 +448,41 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
             } else {
                 putNull("currentUrl")
             }
+        }
+
+    private fun buildOpenAppResultMap(result: InstalledAppLauncher.OpenAppResult) =
+        Arguments.createMap().apply {
+            putBoolean("success", result.success)
+            putString("reason", result.reason)
+            putString("message", result.message)
+            if (result.appName != null) {
+                putString("appName", result.appName)
+            } else {
+                putNull("appName")
+            }
+            if (result.packageName != null) {
+                putString("packageName", result.packageName)
+            } else {
+                putNull("packageName")
+            }
+            if (result.matchedLabel != null) {
+                putString("matchedLabel", result.matchedLabel)
+            } else {
+                putNull("matchedLabel")
+            }
+            if (result.attemptedResolvedPackageName != null) {
+                putString("attemptedResolvedPackageName", result.attemptedResolvedPackageName)
+            } else {
+                putNull("attemptedResolvedPackageName")
+            }
+        }
+
+    private fun buildReturnToAutoCallResultMap(result: AutoCallAppNavigator.ReturnToAutoCallResult) =
+        Arguments.createMap().apply {
+            putBoolean("success", result.success)
+            putString("reason", result.reason)
+            putString("message", result.message)
+            putBoolean("noOp", result.noOp)
+            putBoolean("webViewWasOpen", result.webViewWasOpen)
         }
 }

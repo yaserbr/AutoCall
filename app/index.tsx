@@ -20,7 +20,9 @@ import {
   enableAutoAnswer,
   endCurrentCall,
   getStatus,
+  openInstalledApp,
   openInAppWebView,
+  returnToAutoCall,
   startSimpleCall,
   startServerCommandCall,
   startServerCommandSms,
@@ -41,11 +43,29 @@ const DEVICE_UID_REGEX = /^[a-z0-9]{5}$/;
 type ServerCallCommand = {
   id: string;
   deviceUid: string;
-  action?: "call" | "end" | "sms" | "auto_answer" | "open_url" | "close_webview";
-  type: "CALL" | "END" | "SMS" | "AUTO_ANSWER" | "OPEN_URL" | "CLOSE_WEBVIEW";
+  action?:
+    | "call"
+    | "end"
+    | "sms"
+    | "auto_answer"
+    | "open_url"
+    | "close_webview"
+    | "open_app"
+    | "return_to_autocall";
+  type:
+    | "CALL"
+    | "END"
+    | "SMS"
+    | "AUTO_ANSWER"
+    | "OPEN_URL"
+    | "CLOSE_WEBVIEW"
+    | "OPEN_APP"
+    | "RETURN_TO_AUTOCALL";
   phoneNumber?: string | null;
   message?: string | null;
   url?: string | null;
+  appName?: string | null;
+  resolvedPackageName?: string | null;
   durationSeconds?: number | null;
   enabled?: boolean | null;
   autoHangupSeconds?: number | null;
@@ -79,7 +99,9 @@ type ServerCommandAction =
   | "sms"
   | "auto_answer"
   | "open_url"
-  | "close_webview";
+  | "close_webview"
+  | "open_app"
+  | "return_to_autocall";
 
 const emptyState: UiState = {
   autoAnswerEnabled: false,
@@ -143,6 +165,14 @@ const normalizeHttpUrl = (input: string | null | undefined): string | null => {
   } catch {
     return null;
   }
+};
+
+const normalizeAppName = (input: string | null | undefined): string | null => {
+  if (typeof input !== "string") {
+    return null;
+  }
+  const normalized = input.trim().replace(/\s+/g, " ");
+  return normalized || null;
 };
 
 const formatTime = (timestamp: number): string => {
@@ -781,6 +811,89 @@ export default function AutoCallScreen() {
     }
   };
 
+  const executeOpenAppCommand = async (
+    commandId: string,
+    rawAppName: string | null | undefined,
+    resolvedPackageName: string | null | undefined
+  ): Promise<boolean> => {
+    const normalizedAppName = normalizeAppName(rawAppName);
+    if (!normalizedAppName) {
+      await updateCommandStatus(commandId, "failed", "OPEN_APP command missing appName");
+      setStatusMessage("OPEN_APP command failed: missing appName");
+      logEvent("open_app_invalid", { commandId, rawAppName });
+      return false;
+    }
+
+    try {
+      inFlightCommandIds.current.add(commandId);
+      logEvent("command_execution_started", {
+        commandId,
+        action: "open_app",
+        appName: normalizedAppName,
+        resolvedPackageName: resolvedPackageName ?? null,
+      });
+      logEvent("open_app_received", {
+        commandId,
+        appName: normalizedAppName,
+        resolvedPackageName: resolvedPackageName ?? null,
+      });
+
+      const result = await openInstalledApp(normalizedAppName, resolvedPackageName ?? null);
+      if (!result.success) {
+        const failureReason =
+          typeof result.message === "string" && result.message.trim()
+            ? result.message.trim()
+            : "App not installed";
+        await updateCommandStatus(commandId, "failed", failureReason);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "open_app",
+          result: "failed",
+          reason: result.reason,
+          message: failureReason,
+        });
+        setStatusMessage(`OPEN_APP failed: ${failureReason}`);
+        return false;
+      }
+
+      await updateCommandStatus(commandId, "executed");
+      logEvent("open_app_launched", {
+        commandId,
+        appName: normalizedAppName,
+        packageName: result.packageName ?? null,
+        matchedLabel: result.matchedLabel ?? null,
+      });
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "open_app",
+        result: "executed",
+      });
+      setStatusMessage(
+        result.matchedLabel
+          ? `OPEN_APP executed: ${result.matchedLabel}`
+          : `OPEN_APP executed: ${normalizedAppName}`
+      );
+      return true;
+    } catch (error) {
+      logEvent("execute_open_app_command_failed", {
+        error,
+        commandId,
+        appName: rawAppName,
+        resolvedPackageName: resolvedPackageName ?? null,
+      });
+      await updateCommandStatus(commandId, "failed", "App not installed");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "open_app",
+        result: "failed",
+      });
+      setStatusMessage("OPEN_APP failed: App not installed");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
   const executeOpenUrlCommand = async (
     commandId: string,
     rawUrl: string | null | undefined
@@ -923,6 +1036,65 @@ export default function AutoCallScreen() {
     }
   };
 
+  const executeReturnToAutoCallCommand = async (commandId: string): Promise<boolean> => {
+    try {
+      inFlightCommandIds.current.add(commandId);
+      logEvent("command_execution_started", { commandId, action: "return_to_autocall" });
+      logEvent("return_to_autocall_received", { commandId });
+
+      const result = await returnToAutoCall();
+      if (!result.success) {
+        const failureReason =
+          typeof result.message === "string" && result.message.trim()
+            ? result.message.trim()
+            : "Failed to return to AutoCall";
+        await updateCommandStatus(commandId, "failed", failureReason);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "return_to_autocall",
+          result: "failed",
+          reason: result.reason,
+          message: failureReason,
+        });
+        setStatusMessage(`RETURN_TO_AUTOCALL failed: ${failureReason}`);
+        return false;
+      }
+
+      await refreshInAppWebViewState();
+      await updateCommandStatus(commandId, "executed");
+      if (result.noOp) {
+        logEvent("return_to_autocall_noop_already_foreground", { commandId });
+        setStatusMessage("RETURN_TO_AUTOCALL applied (already on AutoCall)");
+      } else {
+        logEvent("return_to_autocall_opened_autocall", {
+          commandId,
+          webViewWasOpen: result.webViewWasOpen,
+        });
+        setStatusMessage("Returned to AutoCall from server command");
+      }
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "return_to_autocall",
+        result: "executed",
+        noOp: result.noOp,
+        webViewWasOpen: result.webViewWasOpen,
+      });
+      return true;
+    } catch (error) {
+      logEvent("execute_return_to_autocall_command_failed", { error, commandId });
+      await updateCommandStatus(commandId, "failed", "Failed to execute RETURN_TO_AUTOCALL command");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "return_to_autocall",
+        result: "failed",
+      });
+      setStatusMessage("Failed to execute RETURN_TO_AUTOCALL command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
   const resolveCommandAction = (
     command: ServerCallCommand
   ): ServerCommandAction => {
@@ -933,7 +1105,9 @@ export default function AutoCallScreen() {
       explicitAction === "sms" ||
       explicitAction === "auto_answer" ||
       explicitAction === "open_url" ||
-      explicitAction === "close_webview"
+      explicitAction === "close_webview" ||
+      explicitAction === "open_app" ||
+      explicitAction === "return_to_autocall"
     ) {
       return explicitAction;
     }
@@ -943,6 +1117,8 @@ export default function AutoCallScreen() {
     if (command.type === "AUTO_ANSWER") return "auto_answer";
     if (command.type === "OPEN_URL") return "open_url";
     if (command.type === "CLOSE_WEBVIEW") return "close_webview";
+    if (command.type === "OPEN_APP") return "open_app";
+    if (command.type === "RETURN_TO_AUTOCALL") return "return_to_autocall";
     return "call";
   };
 
@@ -988,6 +1164,19 @@ export default function AutoCallScreen() {
         return;
       }
 
+      if (action === "open_app") {
+        if (!command.appName) {
+          await updateCommandStatus(commandId, "failed", "OPEN_APP command missing appName");
+          return;
+        }
+        await executeOpenAppCommand(
+          commandId,
+          command.appName,
+          command.resolvedPackageName ?? null
+        );
+        return;
+      }
+
       if (action === "open_url") {
         if (!command.url) {
           await updateCommandStatus(commandId, "failed", "OPEN_URL command missing url");
@@ -999,6 +1188,11 @@ export default function AutoCallScreen() {
 
       if (action === "close_webview") {
         await executeCloseWebViewCommand(commandId);
+        return;
+      }
+
+      if (action === "return_to_autocall") {
+        await executeReturnToAutoCallCommand(commandId);
         return;
       }
 
@@ -1056,6 +1250,15 @@ export default function AutoCallScreen() {
 
     if (command.type === "CLOSE_WEBVIEW") {
       return "CLOSE_WEBVIEW";
+    }
+
+    if (command.type === "OPEN_APP") {
+      const normalizedAppName = normalizeAppName(command.appName);
+      return normalizedAppName ? `OPEN_APP (${normalizedAppName})` : "OPEN_APP";
+    }
+
+    if (command.type === "RETURN_TO_AUTOCALL") {
+      return "RETURN_TO_AUTOCALL";
     }
 
     return `${command.type}${command.phoneNumber ? ` (${command.phoneNumber})` : ""}`;

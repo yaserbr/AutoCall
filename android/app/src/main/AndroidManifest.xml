@@ -17,6 +17,10 @@
       <category android:name="android.intent.category.BROWSABLE"/>
       <data android:scheme="https"/>
     </intent>
+    <intent>
+      <action android:name="android.intent.action.MAIN"/>
+      <category android:name="android.intent.category.LAUNCHER"/>
+    </intent>
   </queries>
   <application android:name=".MainApplication" android:label="@string/app_name" android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher_round" android:allowBackup="true" android:theme="@style/AppTheme" android:supportsRtl="true" android:enableOnBackInvokedCallback="false">
     <meta-data android:name="expo.modules.updates.ENABLED" android:value="false"/>
@@ -53,5 +57,13 @@
       android:launchMode="singleTask"
       android:screenOrientation="portrait"
       android:theme="@style/AppTheme" />
+    <activity
+      android:name=".ReturnToAutoCallTrampolineActivity"
+      android:exported="false"
+      android:excludeFromRecents="true"
+      android:finishOnTaskLaunch="true"
+      android:launchMode="singleTask"
+      android:noHistory="true"
+      android:theme="@style/Theme.AutoCall.ReturnHandoff" />
   </application>
 </manifest>

@@ -58,6 +58,8 @@ class AutoCallCommandPollingService : Service() {
         val phoneNumber: String?,
         val message: String?,
         val url: String?,
+        val appName: String?,
+        val resolvedPackageName: String?,
         val durationSeconds: Int?,
         val enabled: Boolean?,
         val autoHangupSeconds: Int?,
@@ -299,6 +301,8 @@ class AutoCallCommandPollingService : Service() {
                 item.optString("message").takeIf { value -> value.isNotBlank() }
             },
             url = parseUrl(item),
+            appName = parseAppName(item),
+            resolvedPackageName = parseResolvedPackageName(item),
             durationSeconds = parseDurationSeconds(item),
             enabled = parseAutoAnswerEnabled(item),
             autoHangupSeconds = parseAutoHangupSeconds(item),
@@ -366,8 +370,10 @@ class AutoCallCommandPollingService : Service() {
             "end" -> dispatchEndCommand(command)
             "sms" -> dispatchSmsCommand(command)
             "auto_answer" -> dispatchAutoAnswerCommand(command)
+            "open_app" -> dispatchOpenAppCommand(command)
             "open_url" -> dispatchOpenUrlCommand(command)
             "close_webview" -> dispatchCloseWebViewCommand(command)
+            "return_to_autocall" -> dispatchReturnToAutoCallCommand(command)
             else -> dispatchCallCommand(command)
         }
     }
@@ -380,16 +386,20 @@ class AutoCallCommandPollingService : Service() {
                 "end",
                 "sms",
                 "auto_answer",
+                "open_app",
                 "open_url",
-                "close_webview" -> return explicitAction
+                "close_webview",
+                "return_to_autocall" -> return explicitAction
             }
         }
         return when {
             command.type.equals("END", ignoreCase = true) -> "end"
             command.type.equals("SMS", ignoreCase = true) -> "sms"
             command.type.equals("AUTO_ANSWER", ignoreCase = true) -> "auto_answer"
+            command.type.equals("OPEN_APP", ignoreCase = true) -> "open_app"
             command.type.equals("OPEN_URL", ignoreCase = true) -> "open_url"
             command.type.equals("CLOSE_WEBVIEW", ignoreCase = true) -> "close_webview"
+            command.type.equals("RETURN_TO_AUTOCALL", ignoreCase = true) -> "return_to_autocall"
             else -> "call"
         }
     }
@@ -605,6 +615,86 @@ class AutoCallCommandPollingService : Service() {
         }
     }
 
+    private fun dispatchOpenAppCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=open_app"
+            )
+            val appName = command.appName
+            val resolvedPackageName = command.resolvedPackageName
+            if (appName.isNullOrBlank() && resolvedPackageName.isNullOrBlank()) {
+                updateCommandStatus(
+                    command.id,
+                    "failed",
+                    "OPEN_APP command missing appName/resolvedPackageName"
+                )
+                Log.w(
+                    TAG,
+                    "background/runtime OPEN_APP command missing appName/resolvedPackageName commandId=${command.id}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=open_app result=failed"
+                )
+                return false
+            }
+
+            Log.i(
+                TAG,
+                "background/runtime OPEN_APP command received commandId=${command.id} " +
+                    "appName=${appName ?: "null"} resolvedPackageName=${resolvedPackageName ?: "null"}"
+            )
+
+            val result = InstalledAppLauncher.openApp(
+                context = applicationContext,
+                appName = appName,
+                resolvedPackageName = resolvedPackageName
+            )
+
+            if (!result.success) {
+                val failureReason = result.message.ifBlank { "App not installed" }
+                updateCommandStatus(command.id, "failed", failureReason)
+                Log.w(
+                    TAG,
+                    "background/runtime OPEN_APP command failed commandId=${command.id} " +
+                        "reason=${result.reason} message=${result.message} " +
+                        "appName=${appName ?: "null"} packageName=${result.packageName ?: "null"} " +
+                        "attemptedResolvedPackageName=${result.attemptedResolvedPackageName ?: "null"}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=open_app result=failed"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            Log.i(
+                TAG,
+                "background/runtime OPEN_APP command executed commandId=${command.id} " +
+                    "appName=${appName ?: "null"} packageName=${result.packageName ?: "null"} " +
+                    "matchedLabel=${result.matchedLabel ?: "null"}"
+            )
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=open_app result=executed"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(TAG, "background/runtime OPEN_APP command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", error.message ?: "App not installed")
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=open_app result=failed"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
     private fun dispatchOpenUrlCommand(command: ServerCallCommand): Boolean {
         inFlightCommandIds.add(command.id)
         try {
@@ -734,6 +824,72 @@ class AutoCallCommandPollingService : Service() {
         }
     }
 
+    private fun dispatchReturnToAutoCallCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=return_to_autocall"
+            )
+            Log.i(
+                TAG,
+                "background/runtime RETURN_TO_AUTOCALL command received commandId=${command.id}"
+            )
+
+            val result = AutoCallAppNavigator.returnToAutoCall(applicationContext)
+            if (!result.success) {
+                updateCommandStatus(command.id, "failed", result.message)
+                Log.w(
+                    TAG,
+                    "background/runtime RETURN_TO_AUTOCALL command failed commandId=${command.id} " +
+                        "reason=${result.reason} message=${result.message}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=return_to_autocall result=failed"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            if (result.noOp) {
+                Log.i(
+                    TAG,
+                    "background/runtime RETURN_TO_AUTOCALL no-op commandId=${command.id} already in AutoCall"
+                )
+            } else {
+                Log.i(
+                    TAG,
+                    "background/runtime RETURN_TO_AUTOCALL command executed commandId=${command.id} " +
+                        "webViewWasOpen=${result.webViewWasOpen}"
+                )
+            }
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=return_to_autocall result=executed"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(
+                TAG,
+                "background/runtime RETURN_TO_AUTOCALL command crash commandId=${command.id}",
+                error
+            )
+            updateCommandStatus(
+                command.id,
+                "failed",
+                error.message ?: "return_to_autocall_command_crash"
+            )
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=return_to_autocall result=failed"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
     private fun updateCommandStatus(
         commandId: String,
         status: String,
@@ -818,6 +974,20 @@ class AutoCallCommandPollingService : Service() {
             return null
         }
         return item.optString("url").takeIf { value -> value.isNotBlank() }
+    }
+
+    private fun parseAppName(item: JSONObject): String? {
+        if (item.isNull("appName")) {
+            return null
+        }
+        return item.optString("appName").takeIf { value -> value.isNotBlank() }
+    }
+
+    private fun parseResolvedPackageName(item: JSONObject): String? {
+        if (item.isNull("resolvedPackageName")) {
+            return null
+        }
+        return item.optString("resolvedPackageName").takeIf { value -> value.isNotBlank() }
     }
 
     private fun hasAutoAnswerPermissions(): Boolean {

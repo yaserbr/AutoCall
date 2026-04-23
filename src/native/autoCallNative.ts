@@ -30,6 +30,24 @@ type InAppWebViewCommandResult = {
   currentUrl: string | null;
 };
 
+type OpenInstalledAppResult = {
+  success: boolean;
+  reason: string;
+  message: string;
+  appName: string | null;
+  packageName: string | null;
+  matchedLabel: string | null;
+  attemptedResolvedPackageName: string | null;
+};
+
+type ReturnToAutoCallResult = {
+  success: boolean;
+  reason: string;
+  message: string;
+  noOp: boolean;
+  webViewWasOpen: boolean;
+};
+
 type OutgoingCallResult = {
   action: string;
   phoneNumber: string;
@@ -69,6 +87,8 @@ type AutoCallNativeModule = {
   openInAppWebView(url: string): Promise<InAppWebViewCommandResult>;
   closeInAppWebView(): Promise<InAppWebViewCommandResult>;
   getInAppWebViewState(): Promise<InAppWebViewState>;
+  openInstalledApp(appName: string, resolvedPackageName: string | null): Promise<OpenInstalledAppResult>;
+  returnToAutoCall(): Promise<ReturnToAutoCallResult>;
 };
 
 const getNativeModule = (): AutoCallNativeModule => {
@@ -108,3 +128,8 @@ export const openInAppWebView = (url: string) => getNativeModule().openInAppWebV
 export const closeInAppWebView = () => getNativeModule().closeInAppWebView();
 
 export const getInAppWebViewState = () => getNativeModule().getInAppWebViewState();
+
+export const openInstalledApp = (appName: string, resolvedPackageName?: string | null) =>
+  getNativeModule().openInstalledApp(appName, resolvedPackageName ?? null);
+
+export const returnToAutoCall = () => getNativeModule().returnToAutoCall();

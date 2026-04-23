@@ -3,6 +3,7 @@ import expo.modules.splashscreen.SplashScreenManager
 
 import android.os.Build
 import android.os.Bundle
+import android.content.Intent
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
@@ -20,6 +21,7 @@ class MainActivity : ReactActivity() {
     // @generated begin expo-splashscreen - expo prebuild (DO NOT MODIFY) sync-f3ff59a738c56c9a6119210cb55f0b613eb8b6af
     SplashScreenManager.registerOnActivity(this)
     // @generated end expo-splashscreen
+    AppForegroundTracker.onMainActivityCreated()
     super.onCreate(null)
   }
 
@@ -61,5 +63,20 @@ class MainActivity : ReactActivity() {
       // Use the default back button implementation on Android S
       // because it's doing more than [Activity.moveTaskToBack] in fact.
       super.invokeDefaultOnBackPressed()
+  }
+
+  override fun onResume() {
+      super.onResume()
+      AppForegroundTracker.onMainActivityResumed()
+  }
+
+  override fun onPause() {
+      AppForegroundTracker.onMainActivityPaused()
+      super.onPause()
+  }
+
+  override fun onNewIntent(intent: Intent?) {
+      super.onNewIntent(intent)
+      AppForegroundTracker.onMainActivityNewIntent()
   }
 }
