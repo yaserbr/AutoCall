@@ -11,11 +11,4 @@
     <item name="postSplashScreenTheme">@style/AppTheme</item>
     <item name="android:windowSplashScreenBehavior">icon_preferred</item>
   </style>
-  <style name="Theme.AutoCall.ReturnHandoff" parent="AppTheme">
-    <item name="android:windowIsTranslucent">true</item>
-    <item name="android:windowBackground">@android:color/transparent</item>
-    <item name="android:windowNoTitle">true</item>
-    <item name="android:backgroundDimEnabled">false</item>
-    <item name="android:windowDisablePreview">true</item>
-  </style>
 </resources>

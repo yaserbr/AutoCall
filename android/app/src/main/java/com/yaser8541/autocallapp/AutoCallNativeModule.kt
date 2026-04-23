@@ -389,8 +389,7 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         Log.i(TAG, "RETURN_TO_AUTOCALL received in native module")
         try {
             val result = AutoCallAppNavigator.returnToAutoCall(
-                context = reactContext,
-                currentActivity = reactContext.currentActivity
+                context = reactContext
             )
             promise.resolve(buildReturnToAutoCallResultMap(result))
         } catch (error: Throwable) {

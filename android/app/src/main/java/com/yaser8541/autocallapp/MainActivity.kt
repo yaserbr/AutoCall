@@ -3,7 +3,6 @@ import expo.modules.splashscreen.SplashScreenManager
 
 import android.os.Build
 import android.os.Bundle
-import android.content.Intent
 
 import com.facebook.react.ReactActivity
 import com.facebook.react.ReactActivityDelegate
@@ -75,8 +74,8 @@ class MainActivity : ReactActivity() {
       super.onPause()
   }
 
-  override fun onNewIntent(intent: Intent?) {
-      super.onNewIntent(intent)
-      AppForegroundTracker.onMainActivityNewIntent()
+  override fun onWindowFocusChanged(hasFocus: Boolean) {
+      super.onWindowFocusChanged(hasFocus)
+      AppForegroundTracker.onMainActivityWindowFocusChanged(hasFocus)
   }
 }

@@ -8,18 +8,20 @@ object AppForegroundTracker {
 
     data class Snapshot(
         val isMainActivityResumed: Boolean,
+        val isMainActivityWindowFocused: Boolean,
         val mainActivityCreateCount: Int,
         val mainActivityResumeCount: Int,
         val mainActivityPauseCount: Int,
-        val mainActivityNewIntentCount: Int,
         val lastMainActivityResumeAtMs: Long,
         val lastMainActivityPauseAtMs: Long,
-        val lastMainActivityIntentAtMs: Long,
-        val lastMainActivityCreateAtMs: Long
+        val lastMainActivityWindowFocusChangedAtMs: Long
     )
 
     @Volatile
     private var isMainActivityResumed: Boolean = false
+
+    @Volatile
+    private var isMainActivityWindowFocused: Boolean = false
 
     @Volatile
     private var mainActivityCreateCount: Int = 0
@@ -31,24 +33,17 @@ object AppForegroundTracker {
     private var mainActivityPauseCount: Int = 0
 
     @Volatile
-    private var mainActivityNewIntentCount: Int = 0
-
-    @Volatile
     private var lastMainActivityResumeAtMs: Long = 0L
 
     @Volatile
     private var lastMainActivityPauseAtMs: Long = 0L
 
     @Volatile
-    private var lastMainActivityIntentAtMs: Long = 0L
-
-    @Volatile
-    private var lastMainActivityCreateAtMs: Long = 0L
+    private var lastMainActivityWindowFocusChangedAtMs: Long = 0L
 
     fun onMainActivityCreated() {
         val now = SystemClock.elapsedRealtime()
         mainActivityCreateCount += 1
-        lastMainActivityCreateAtMs = now
         Log.i(TAG, "MainActivity created at=$now count=$mainActivityCreateCount")
     }
 
@@ -63,29 +58,29 @@ object AppForegroundTracker {
     fun onMainActivityPaused() {
         val now = SystemClock.elapsedRealtime()
         isMainActivityResumed = false
+        isMainActivityWindowFocused = false
         mainActivityPauseCount += 1
         lastMainActivityPauseAtMs = now
         Log.i(TAG, "MainActivity paused at=$now count=$mainActivityPauseCount")
     }
 
-    fun onMainActivityNewIntent() {
+    fun onMainActivityWindowFocusChanged(hasFocus: Boolean) {
         val now = SystemClock.elapsedRealtime()
-        mainActivityNewIntentCount += 1
-        lastMainActivityIntentAtMs = now
-        Log.i(TAG, "MainActivity received new intent at=$now count=$mainActivityNewIntentCount")
+        isMainActivityWindowFocused = hasFocus
+        lastMainActivityWindowFocusChangedAtMs = now
+        Log.i(TAG, "MainActivity window focus changed hasFocus=$hasFocus at=$now")
     }
 
     fun snapshot(): Snapshot {
         return Snapshot(
             isMainActivityResumed = isMainActivityResumed,
+            isMainActivityWindowFocused = isMainActivityWindowFocused,
             mainActivityCreateCount = mainActivityCreateCount,
             mainActivityResumeCount = mainActivityResumeCount,
             mainActivityPauseCount = mainActivityPauseCount,
-            mainActivityNewIntentCount = mainActivityNewIntentCount,
             lastMainActivityResumeAtMs = lastMainActivityResumeAtMs,
             lastMainActivityPauseAtMs = lastMainActivityPauseAtMs,
-            lastMainActivityIntentAtMs = lastMainActivityIntentAtMs,
-            lastMainActivityCreateAtMs = lastMainActivityCreateAtMs
+            lastMainActivityWindowFocusChangedAtMs = lastMainActivityWindowFocusChangedAtMs
         )
     }
 }
