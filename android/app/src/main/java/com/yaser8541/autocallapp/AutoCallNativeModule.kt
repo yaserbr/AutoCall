@@ -8,13 +8,19 @@ import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.bridge.ReadableMap
 import com.facebook.react.bridge.UiThreadUtil
+import java.net.HttpURLConnection
+import java.net.URL
 
 class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     companion object {
         private const val TAG = "AutoCall/NativeModule"
+        private const val SERVER = "https://serverautocall-production.up.railway.app"
         private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
+        private const val MIN_DOWNLOAD_SIZE_MB = 10
+        private const val MAX_DOWNLOAD_SIZE_MB = 1000
+        private const val DOWNLOAD_STREAM_CHUNK_BYTES = 64 * 1024
         private const val SEND_SMS_PERMISSION_DENIED_CODE = "E_SEND_SMS_PERMISSION_DENIED"
         private const val SEND_SMS_PERMISSION_DENIED_MESSAGE = "SEND_SMS permission denied"
     }
@@ -236,6 +242,49 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun downloadDataForCommand(downloadSizeMb: Double, promise: Promise) {
+        Thread {
+            try {
+                val normalizedDownloadSizeMb = normalizeDownloadSizeMb(downloadSizeMb)
+                if (normalizedDownloadSizeMb == null) {
+                    promise.resolve(
+                        buildDownloadDataResultMap(
+                            success = false,
+                            reason = "invalid_download_size_mb",
+                            message = "downloadSizeMb must be an integer between $MIN_DOWNLOAD_SIZE_MB and $MAX_DOWNLOAD_SIZE_MB",
+                            downloadSizeMb = null,
+                            durationSeconds = null
+                        )
+                    )
+                    return@Thread
+                }
+
+                val durationSeconds = performDummyDownload(normalizedDownloadSizeMb)
+                promise.resolve(
+                    buildDownloadDataResultMap(
+                        success = true,
+                        reason = "download_completed",
+                        message = "DOWNLOAD_DATA completed",
+                        downloadSizeMb = normalizedDownloadSizeMb,
+                        durationSeconds = durationSeconds
+                    )
+                )
+            } catch (error: Throwable) {
+                Log.e(TAG, "downloadDataForCommand failed", error)
+                promise.resolve(
+                    buildDownloadDataResultMap(
+                        success = false,
+                        reason = "download_failed",
+                        message = error.message ?: "Failed to download dummy data",
+                        downloadSizeMb = null,
+                        durationSeconds = null
+                    )
+                )
+            }
+        }.start()
+    }
+
+    @ReactMethod
     fun enableAutoAnswer(config: ReadableMap?, promise: Promise) {
         try {
             val requestedSeconds: Int? = if (
@@ -418,6 +467,54 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         return normalized.coerceAtMost(MAX_SERVER_CALL_DURATION_SECONDS)
     }
 
+    private fun normalizeDownloadSizeMb(downloadSizeMb: Double?): Int? {
+        if (downloadSizeMb == null || downloadSizeMb.isNaN()) {
+            return null
+        }
+        if (downloadSizeMb % 1.0 != 0.0) {
+            return null
+        }
+        val normalized = downloadSizeMb.toInt()
+        if (normalized < MIN_DOWNLOAD_SIZE_MB || normalized > MAX_DOWNLOAD_SIZE_MB) {
+            return null
+        }
+        return normalized
+    }
+
+    private fun performDummyDownload(downloadSizeMb: Int): Int {
+        var connection: HttpURLConnection? = null
+        try {
+            val startNanos = System.nanoTime()
+            val targetUrl = "$SERVER/dummy-download?mb=$downloadSizeMb"
+            connection = URL(targetUrl).openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 120_000
+            connection.useCaches = false
+            connection.setRequestProperty("Accept", "application/octet-stream")
+
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                throw IllegalStateException("DOWNLOAD_DATA request failed with code=$responseCode")
+            }
+
+            val buffer = ByteArray(DOWNLOAD_STREAM_CHUNK_BYTES)
+            connection.inputStream.use { input ->
+                while (true) {
+                    val readBytes = input.read(buffer)
+                    if (readBytes == -1) {
+                        break
+                    }
+                }
+            }
+
+            val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+            return ((elapsedMs + 999L) / 1000L).toInt().coerceAtLeast(1)
+        } finally {
+            connection?.disconnect()
+        }
+    }
+
     private fun buildWebViewStateMap(snapshot: InAppWebViewController.WebViewState) =
         Arguments.createMap().apply {
             putBoolean("isOpen", snapshot.isOpen)
@@ -484,4 +581,26 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
             putBoolean("noOp", result.noOp)
             putBoolean("webViewWasOpen", result.webViewWasOpen)
         }
+
+    private fun buildDownloadDataResultMap(
+        success: Boolean,
+        reason: String,
+        message: String,
+        downloadSizeMb: Int?,
+        durationSeconds: Int?
+    ) = Arguments.createMap().apply {
+        putBoolean("success", success)
+        putString("reason", reason)
+        putString("message", message)
+        if (downloadSizeMb != null) {
+            putDouble("downloadSizeMb", downloadSizeMb.toDouble())
+        } else {
+            putNull("downloadSizeMb")
+        }
+        if (durationSeconds != null) {
+            putDouble("downloadDurationSeconds", durationSeconds.toDouble())
+        } else {
+            putNull("downloadDurationSeconds")
+        }
+    }
 }

@@ -20,6 +20,7 @@ import {
   enableAutoAnswer,
   endCurrentCall,
   getStatus,
+  downloadDataForCommand,
   openInstalledApp,
   openInAppWebView,
   returnToAutoCall,
@@ -35,6 +36,8 @@ const DEFAULT_HANGUP_SECONDS = 20;
 const DEFAULT_SIMPLE_CALL_DURATION_SECONDS = 20;
 const MAX_AUTO_HANGUP_SECONDS = 600;
 const MAX_SIMPLE_CALL_DURATION_SECONDS = 3600;
+const MIN_DOWNLOAD_SIZE_MB = 10;
+const MAX_DOWNLOAD_SIZE_MB = 1000;
 const MAX_TRACKED_PROCESSED_COMMAND_IDS = 500;
 const LOG_PREFIX = "[AutoCall/UI]";
 const SMS_PERMISSION_DENIED_REASON = "SEND_SMS permission denied";
@@ -51,7 +54,8 @@ type ServerCallCommand = {
     | "open_url"
     | "close_webview"
     | "open_app"
-    | "return_to_autocall";
+    | "return_to_autocall"
+    | "download_data";
   type:
     | "CALL"
     | "END"
@@ -60,13 +64,16 @@ type ServerCallCommand = {
     | "OPEN_URL"
     | "CLOSE_WEBVIEW"
     | "OPEN_APP"
-    | "RETURN_TO_AUTOCALL";
+    | "RETURN_TO_AUTOCALL"
+    | "DOWNLOAD_DATA";
   phoneNumber?: string | null;
   message?: string | null;
   url?: string | null;
   appName?: string | null;
   resolvedPackageName?: string | null;
   durationSeconds?: number | null;
+  downloadSizeMb?: number | null;
+  downloadDurationSeconds?: number | null;
   enabled?: boolean | null;
   autoHangupSeconds?: number | null;
   failureReason?: string | null;
@@ -101,7 +108,8 @@ type ServerCommandAction =
   | "open_url"
   | "close_webview"
   | "open_app"
-  | "return_to_autocall";
+  | "return_to_autocall"
+  | "download_data";
 
 const emptyState: UiState = {
   autoAnswerEnabled: false,
@@ -391,17 +399,30 @@ export default function AutoCallScreen() {
   const updateCommandStatus = async (
     id: string,
     status: string,
-    failureReason?: string | null
+    failureReason?: string | null,
+    downloadDurationSeconds?: number | null
   ) => {
     try {
-      const payload: { status: string; failureReason?: string } = { status };
+      const payload: {
+        status: string;
+        failureReason?: string;
+        downloadDurationSeconds?: number;
+      } = { status };
       if (typeof failureReason === "string" && failureReason.trim()) {
         payload.failureReason = failureReason.trim();
+      }
+      if (
+        typeof downloadDurationSeconds === "number" &&
+        Number.isFinite(downloadDurationSeconds) &&
+        downloadDurationSeconds > 0
+      ) {
+        payload.downloadDurationSeconds = Math.round(downloadDurationSeconds);
       }
       logEvent("command_status_update_request", {
         commandId: id,
         status,
         failureReason: payload.failureReason ?? null,
+        downloadDurationSeconds: payload.downloadDurationSeconds ?? null,
       });
       const response = await fetch(`${SERVER}/commands/${id}/status`, {
         method: "POST",
@@ -418,7 +439,13 @@ export default function AutoCallScreen() {
       }
       logEvent("command_status_update_success", { commandId: id, status });
     } catch (error) {
-      logEvent("update_command_status_failed", { id, status, failureReason, error });
+      logEvent("update_command_status_failed", {
+        id,
+        status,
+        failureReason,
+        downloadDurationSeconds: downloadDurationSeconds ?? null,
+        error,
+      });
     }
   };
 
@@ -519,6 +546,22 @@ export default function AutoCallScreen() {
 
     const clamped = Math.max(1, Math.min(autoHangupSeconds, MAX_AUTO_HANGUP_SECONDS));
     return Math.round(clamped);
+  };
+
+  const parseServerDownloadSizeMb = (downloadSizeMb?: number | null): number | null => {
+    if (
+      typeof downloadSizeMb !== "number" ||
+      !Number.isFinite(downloadSizeMb) ||
+      downloadSizeMb % 1 !== 0
+    ) {
+      return null;
+    }
+
+    if (downloadSizeMb < MIN_DOWNLOAD_SIZE_MB || downloadSizeMb > MAX_DOWNLOAD_SIZE_MB) {
+      return null;
+    }
+
+    return Math.round(downloadSizeMb);
   };
 
   const executeOutgoingCall = async (
@@ -1095,6 +1138,96 @@ export default function AutoCallScreen() {
     }
   };
 
+  const executeDownloadDataCommand = async (
+    commandId: string,
+    downloadSizeMb?: number | null
+  ): Promise<boolean> => {
+    const normalizedDownloadSizeMb = parseServerDownloadSizeMb(downloadSizeMb);
+    if (normalizedDownloadSizeMb === null) {
+      const failureReason =
+        `DOWNLOAD_DATA command has invalid downloadSizeMb ` +
+        `(expected ${MIN_DOWNLOAD_SIZE_MB}-${MAX_DOWNLOAD_SIZE_MB})`;
+      await updateCommandStatus(commandId, "failed", failureReason);
+      setStatusMessage(failureReason);
+      logEvent("download_data_invalid_size", { commandId, downloadSizeMb: downloadSizeMb ?? null });
+      return false;
+    }
+
+    try {
+      inFlightCommandIds.current.add(commandId);
+      logEvent("command_execution_started", {
+        commandId,
+        action: "download_data",
+        downloadSizeMb: normalizedDownloadSizeMb,
+      });
+
+      const result = await downloadDataForCommand(normalizedDownloadSizeMb);
+      if (!result.success) {
+        const failureReason =
+          typeof result.message === "string" && result.message.trim()
+            ? result.message.trim()
+            : "Failed to execute DOWNLOAD_DATA command";
+        await updateCommandStatus(commandId, "failed", failureReason);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "download_data",
+          result: "failed",
+          reason: result.reason,
+          message: failureReason,
+        });
+        setStatusMessage(`DOWNLOAD_DATA failed: ${failureReason}`);
+        return false;
+      }
+
+      const durationSecondsRaw = result.downloadDurationSeconds;
+      const normalizedDurationSeconds =
+        typeof durationSecondsRaw === "number" &&
+        Number.isFinite(durationSecondsRaw) &&
+        durationSecondsRaw > 0
+          ? Math.round(durationSecondsRaw)
+          : null;
+
+      if (!normalizedDurationSeconds) {
+        const failureReason = "DOWNLOAD_DATA completed without valid duration";
+        await updateCommandStatus(commandId, "failed", failureReason);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "download_data",
+          result: "failed",
+          reason: "invalid_duration",
+          message: failureReason,
+        });
+        setStatusMessage(`DOWNLOAD_DATA failed: ${failureReason}`);
+        return false;
+      }
+
+      await updateCommandStatus(commandId, "executed", null, normalizedDurationSeconds);
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "download_data",
+        result: "executed",
+        downloadSizeMb: normalizedDownloadSizeMb,
+        downloadDurationSeconds: normalizedDurationSeconds,
+      });
+      setStatusMessage(
+        `DOWNLOAD_DATA completed (${normalizedDownloadSizeMb} MB in ${normalizedDurationSeconds} sec)`
+      );
+      return true;
+    } catch (error) {
+      logEvent("execute_download_data_command_failed", { error, commandId, downloadSizeMb });
+      await updateCommandStatus(commandId, "failed", "Failed to execute DOWNLOAD_DATA command");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "download_data",
+        result: "failed",
+      });
+      setStatusMessage("Failed to execute DOWNLOAD_DATA command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
   const resolveCommandAction = (
     command: ServerCallCommand
   ): ServerCommandAction => {
@@ -1107,7 +1240,8 @@ export default function AutoCallScreen() {
       explicitAction === "open_url" ||
       explicitAction === "close_webview" ||
       explicitAction === "open_app" ||
-      explicitAction === "return_to_autocall"
+      explicitAction === "return_to_autocall" ||
+      explicitAction === "download_data"
     ) {
       return explicitAction;
     }
@@ -1119,6 +1253,7 @@ export default function AutoCallScreen() {
     if (command.type === "CLOSE_WEBVIEW") return "close_webview";
     if (command.type === "OPEN_APP") return "open_app";
     if (command.type === "RETURN_TO_AUTOCALL") return "return_to_autocall";
+    if (command.type === "DOWNLOAD_DATA") return "download_data";
     return "call";
   };
 
@@ -1196,6 +1331,11 @@ export default function AutoCallScreen() {
         return;
       }
 
+      if (action === "download_data") {
+        await executeDownloadDataCommand(commandId, command.downloadSizeMb ?? null);
+        return;
+      }
+
       if (action === "sms") {
         if (!command.phoneNumber) {
           await updateCommandStatus(commandId, "failed", "SMS command missing phoneNumber");
@@ -1259,6 +1399,14 @@ export default function AutoCallScreen() {
 
     if (command.type === "RETURN_TO_AUTOCALL") {
       return "RETURN_TO_AUTOCALL";
+    }
+
+    if (command.type === "DOWNLOAD_DATA") {
+      const normalizedDownloadSizeMb = parseServerDownloadSizeMb(command.downloadSizeMb ?? null);
+      if (normalizedDownloadSizeMb) {
+        return `DOWNLOAD_DATA (${normalizedDownloadSizeMb} MB)`;
+      }
+      return "DOWNLOAD_DATA";
     }
 
     return `${command.type}${command.phoneNumber ? ` (${command.phoneNumber})` : ""}`;

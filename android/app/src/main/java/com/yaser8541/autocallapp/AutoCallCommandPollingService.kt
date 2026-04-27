@@ -29,6 +29,9 @@ class AutoCallCommandPollingService : Service() {
         private const val POLL_INTERVAL_MS = 10_000L
         private const val MAX_AUTO_HANGUP_SECONDS = 600
         private const val MAX_SERVER_CALL_DURATION_SECONDS = 3600
+        private const val MIN_DOWNLOAD_SIZE_MB = 10
+        private const val MAX_DOWNLOAD_SIZE_MB = 1000
+        private const val DOWNLOAD_STREAM_CHUNK_BYTES = 64 * 1024
         private const val MAX_TRACKED_PROCESSED_COMMAND_IDS = 500
 
         private const val CHANNEL_ID = "autocall_background_command_polling"
@@ -61,6 +64,7 @@ class AutoCallCommandPollingService : Service() {
         val appName: String?,
         val resolvedPackageName: String?,
         val durationSeconds: Int?,
+        val downloadSizeMb: Int?,
         val enabled: Boolean?,
         val autoHangupSeconds: Int?,
         val scheduledAt: String?
@@ -304,6 +308,7 @@ class AutoCallCommandPollingService : Service() {
             appName = parseAppName(item),
             resolvedPackageName = parseResolvedPackageName(item),
             durationSeconds = parseDurationSeconds(item),
+            downloadSizeMb = parseDownloadSizeMb(item),
             enabled = parseAutoAnswerEnabled(item),
             autoHangupSeconds = parseAutoHangupSeconds(item),
             scheduledAt = if (item.isNull("scheduledAt")) null else item.optString("scheduledAt")
@@ -374,6 +379,7 @@ class AutoCallCommandPollingService : Service() {
             "open_url" -> dispatchOpenUrlCommand(command)
             "close_webview" -> dispatchCloseWebViewCommand(command)
             "return_to_autocall" -> dispatchReturnToAutoCallCommand(command)
+            "download_data" -> dispatchDownloadDataCommand(command)
             else -> dispatchCallCommand(command)
         }
     }
@@ -389,7 +395,8 @@ class AutoCallCommandPollingService : Service() {
                 "open_app",
                 "open_url",
                 "close_webview",
-                "return_to_autocall" -> return explicitAction
+                "return_to_autocall",
+                "download_data" -> return explicitAction
             }
         }
         return when {
@@ -400,6 +407,7 @@ class AutoCallCommandPollingService : Service() {
             command.type.equals("OPEN_URL", ignoreCase = true) -> "open_url"
             command.type.equals("CLOSE_WEBVIEW", ignoreCase = true) -> "close_webview"
             command.type.equals("RETURN_TO_AUTOCALL", ignoreCase = true) -> "return_to_autocall"
+            command.type.equals("DOWNLOAD_DATA", ignoreCase = true) -> "download_data"
             else -> "call"
         }
     }
@@ -890,27 +898,92 @@ class AutoCallCommandPollingService : Service() {
         }
     }
 
+    private fun dispatchDownloadDataCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=download_data"
+            )
+
+            val requestedSizeMb = command.downloadSizeMb
+            if (
+                requestedSizeMb == null ||
+                requestedSizeMb < MIN_DOWNLOAD_SIZE_MB ||
+                requestedSizeMb > MAX_DOWNLOAD_SIZE_MB
+            ) {
+                val failureReason =
+                    "DOWNLOAD_DATA command has invalid downloadSizeMb (expected $MIN_DOWNLOAD_SIZE_MB-$MAX_DOWNLOAD_SIZE_MB)"
+                updateCommandStatus(command.id, "failed", failureReason)
+                Log.w(
+                    TAG,
+                    "background/runtime DOWNLOAD_DATA invalid size commandId=${command.id} downloadSizeMb=${requestedSizeMb ?: "null"}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=download_data result=failed"
+                )
+                return false
+            }
+
+            val durationSeconds = downloadDummyData(requestedSizeMb)
+            updateCommandStatus(
+                command.id,
+                "executed",
+                failureReason = null,
+                downloadDurationSeconds = durationSeconds
+            )
+            Log.i(
+                TAG,
+                "background/runtime DOWNLOAD_DATA command executed commandId=${command.id} " +
+                    "downloadSizeMb=$requestedSizeMb durationSeconds=$durationSeconds"
+            )
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=download_data result=executed"
+            )
+            return true
+        } catch (error: Throwable) {
+            val failureReason = error.message ?: "download_data_command_crash"
+            Log.e(TAG, "background/runtime DOWNLOAD_DATA command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", failureReason)
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=download_data result=failed"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
     private fun updateCommandStatus(
         commandId: String,
         status: String,
-        failureReason: String? = null
+        failureReason: String? = null,
+        downloadDurationSeconds: Int? = null
     ) {
         val payload = JSONObject().apply {
             put("status", status)
             if (!failureReason.isNullOrBlank()) {
                 put("failureReason", failureReason)
             }
+            if (downloadDurationSeconds != null && downloadDurationSeconds > 0) {
+                put("downloadDurationSeconds", downloadDurationSeconds)
+            }
         }
         Log.i(
             TAG,
-            "background/runtime status update request commandId=$commandId status=$status failureReason=${failureReason ?: "null"}"
+            "background/runtime status update request commandId=$commandId status=$status " +
+                "failureReason=${failureReason ?: "null"} downloadDurationSeconds=${downloadDurationSeconds ?: "null"}"
         )
         val result = postJson("$SERVER/commands/$commandId/status", payload)
         if (!result.isSuccessCode()) {
             Log.w(
                 TAG,
                 "background/runtime update command status failed commandId=$commandId " +
-                    "status=$status failureReason=${failureReason ?: "null"} code=${result.code}"
+                    "status=$status failureReason=${failureReason ?: "null"} " +
+                    "downloadDurationSeconds=${downloadDurationSeconds ?: "null"} code=${result.code}"
             )
             return
         }
@@ -930,6 +1003,24 @@ class AutoCallCommandPollingService : Service() {
             return null
         }
         return normalized.coerceAtMost(MAX_SERVER_CALL_DURATION_SECONDS)
+    }
+
+    private fun parseDownloadSizeMb(item: JSONObject): Int? {
+        if (item.isNull("downloadSizeMb")) {
+            return null
+        }
+        val raw = item.optDouble("downloadSizeMb", Double.NaN)
+        if (raw.isNaN()) {
+            return null
+        }
+        if (raw % 1.0 != 0.0) {
+            return null
+        }
+        val normalized = raw.toInt()
+        if (normalized < MIN_DOWNLOAD_SIZE_MB || normalized > MAX_DOWNLOAD_SIZE_MB) {
+            return null
+        }
+        return normalized
     }
 
     private fun parseAutoAnswerEnabled(item: JSONObject): Boolean? {
@@ -1025,6 +1116,46 @@ class AutoCallCommandPollingService : Service() {
             )
         } catch (error: Throwable) {
             Log.w(TAG, "background/runtime identity sync parse failed", error)
+        }
+    }
+
+    private fun downloadDummyData(downloadSizeMb: Int): Int {
+        var connection: HttpURLConnection? = null
+        try {
+            val startNanos = System.nanoTime()
+            val targetUrl = "$SERVER/dummy-download?mb=$downloadSizeMb"
+            connection = URL(targetUrl).openConnection() as HttpURLConnection
+            connection.requestMethod = "GET"
+            connection.connectTimeout = 15_000
+            connection.readTimeout = 120_000
+            connection.useCaches = false
+            connection.setRequestProperty("Accept", "application/octet-stream")
+
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                val errorBody = readResponseBody(connection, responseCode)
+                val message = if (errorBody.isNotBlank()) {
+                    "DOWNLOAD_DATA request failed with code=$responseCode body=$errorBody"
+                } else {
+                    "DOWNLOAD_DATA request failed with code=$responseCode"
+                }
+                throw IllegalStateException(message)
+            }
+
+            val buffer = ByteArray(DOWNLOAD_STREAM_CHUNK_BYTES)
+            connection.inputStream.use { input ->
+                while (true) {
+                    val readBytes = input.read(buffer)
+                    if (readBytes == -1) {
+                        break
+                    }
+                }
+            }
+
+            val elapsedMs = (System.nanoTime() - startNanos) / 1_000_000
+            return ((elapsedMs + 999L) / 1000L).toInt().coerceAtLeast(1)
+        } finally {
+            connection?.disconnect()
         }
     }
 

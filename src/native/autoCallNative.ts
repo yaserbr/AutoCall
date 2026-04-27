@@ -48,6 +48,14 @@ type ReturnToAutoCallResult = {
   webViewWasOpen: boolean;
 };
 
+type DownloadDataResult = {
+  success: boolean;
+  reason: string;
+  message: string;
+  downloadSizeMb: number | null;
+  downloadDurationSeconds: number | null;
+};
+
 type OutgoingCallResult = {
   action: string;
   phoneNumber: string;
@@ -89,6 +97,7 @@ type AutoCallNativeModule = {
   getInAppWebViewState(): Promise<InAppWebViewState>;
   openInstalledApp(appName: string, resolvedPackageName: string | null): Promise<OpenInstalledAppResult>;
   returnToAutoCall(): Promise<ReturnToAutoCallResult>;
+  downloadDataForCommand(downloadSizeMb: number): Promise<DownloadDataResult>;
 };
 
 const getNativeModule = (): AutoCallNativeModule => {
@@ -133,3 +142,6 @@ export const openInstalledApp = (appName: string, resolvedPackageName?: string |
   getNativeModule().openInstalledApp(appName, resolvedPackageName ?? null);
 
 export const returnToAutoCall = () => getNativeModule().returnToAutoCall();
+
+export const downloadDataForCommand = (downloadSizeMb: number) =>
+  getNativeModule().downloadDataForCommand(downloadSizeMb);
