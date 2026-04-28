@@ -45,7 +45,7 @@ object SimpleCallManager {
         activity: Activity?
     ): SimpleCallStartResult {
         val appContext = context.applicationContext
-        val normalizedPhone = normalizePhoneNumber(rawPhoneNumber) ?: run {
+        val dialNumber = normalizeDialNumber(rawPhoneNumber) ?: run {
             return SimpleCallStartResult(
                 success = false,
                 reason = "invalid_number",
@@ -62,12 +62,13 @@ object SimpleCallManager {
                 success = false,
                 reason = "permission_denied",
                 message = "CALL_PHONE permission is required",
-                phoneNumber = normalizedPhone
+                phoneNumber = dialNumber
             )
         }
 
+        val callUri = buildCallUri(dialNumber)
         val callIntent = Intent(Intent.ACTION_CALL).apply {
-            data = Uri.parse("tel:$normalizedPhone")
+            data = callUri
         }
         val canResolve = callIntent.resolveActivity(appContext.packageManager) != null
         if (!canResolve) {
@@ -75,7 +76,7 @@ object SimpleCallManager {
                 success = false,
                 reason = "no_call_activity",
                 message = "No Android activity can resolve ACTION_CALL",
-                phoneNumber = normalizedPhone
+                phoneNumber = dialNumber
             )
         }
 
@@ -97,7 +98,7 @@ object SimpleCallManager {
                 success = true,
                 reason = "started",
                 message = "ACTION_CALL launched successfully",
-                phoneNumber = normalizedPhone,
+                phoneNumber = dialNumber,
                 autoEndMs = normalizedAutoEndMs
             )
         } catch (error: SecurityException) {
@@ -107,7 +108,7 @@ object SimpleCallManager {
                 success = false,
                 reason = "security_exception",
                 message = error.message ?: "SecurityException while launching ACTION_CALL",
-                phoneNumber = normalizedPhone
+                phoneNumber = dialNumber
             )
         } catch (error: ActivityNotFoundException) {
             cancelAutoEndTimer()
@@ -116,7 +117,7 @@ object SimpleCallManager {
                 success = false,
                 reason = "activity_not_found",
                 message = error.message ?: "No activity found for ACTION_CALL",
-                phoneNumber = normalizedPhone
+                phoneNumber = dialNumber
             )
         } catch (error: Throwable) {
             cancelAutoEndTimer()
@@ -125,7 +126,7 @@ object SimpleCallManager {
                 success = false,
                 reason = "action_call_failed",
                 message = error.message ?: "Unexpected error while launching ACTION_CALL",
-                phoneNumber = normalizedPhone
+                phoneNumber = dialNumber
             )
         }
     }
@@ -249,23 +250,16 @@ object SimpleCallManager {
         return normalized.coerceAtMost(Int.MAX_VALUE.toLong())
     }
 
-    private fun normalizePhoneNumber(rawNumber: String): String? {
+    private fun normalizeDialNumber(rawNumber: String): String? {
         val trimmed = rawNumber.trim()
         if (trimmed.isEmpty()) {
             return null
         }
+        return trimmed
+    }
 
-        val normalized = trimmed.replace(Regex("[^\\d+]"), "")
-        val plusCount = normalized.count { it == '+' }
-        if (plusCount > 1 || (plusCount == 1 && !normalized.startsWith("+"))) {
-            return null
-        }
-
-        val digits = normalized.replace("+", "")
-        if (digits.isEmpty()) {
-            return null
-        }
-
-        return normalized
+    private fun buildCallUri(phoneNumber: String): Uri {
+        val encodedNumber = Uri.encode(phoneNumber)
+        return Uri.parse("tel:$encodedNumber")
     }
 }

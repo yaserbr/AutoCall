@@ -18,7 +18,7 @@ data class CallExecutionResult(
 
 object CallExecutor {
     fun placeCall(context: Context, rawNumber: String, activity: Activity? = null): CallExecutionResult {
-        val phoneNumber = normalizePhoneNumber(rawNumber)
+        val phoneNumber = normalizeDialNumber(rawNumber)
 
         val hasPermission = ContextCompat.checkSelfPermission(
             context,
@@ -29,8 +29,9 @@ object CallExecutor {
             throw AutoCallException("E_PERMISSION_DENIED", "CALL_PHONE permission is not granted")
         }
 
+        val encodedNumber = Uri.encode(phoneNumber)
         val callIntent = Intent(Intent.ACTION_CALL).apply {
-            data = Uri.parse("tel:$phoneNumber")
+            data = Uri.parse("tel:$encodedNumber")
         }
 
         val canResolve = callIntent.resolveActivity(context.packageManager) != null
@@ -54,24 +55,11 @@ object CallExecutor {
         )
     }
 
-    private fun normalizePhoneNumber(raw: String): String {
+    private fun normalizeDialNumber(raw: String): String {
         val trimmed = raw.trim()
         if (trimmed.isEmpty()) {
             throw AutoCallException("E_INVALID_NUMBER", "Phone number is empty")
         }
-
-        val normalized = trimmed.replace(Regex("[^\\d+]"), "")
-        val plusCount = normalized.count { it == '+' }
-        if (plusCount > 1 || (plusCount == 1 && !normalized.startsWith("+"))) {
-            throw AutoCallException("E_INVALID_NUMBER", "Phone number format is invalid")
-        }
-
-        val digits = normalized.replace("+", "")
-        if (digits.isEmpty()) {
-            throw AutoCallException("E_INVALID_NUMBER", "Phone number does not contain digits")
-        }
-
-        return normalized
+        return trimmed
     }
 }
-

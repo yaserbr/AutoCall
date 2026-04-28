@@ -140,7 +140,13 @@ const normalizeDeviceUid = (value: string | null | undefined): string => {
   return DEVICE_UID_REGEX.test(normalized) ? normalized : "";
 };
 
-const normalizePhoneNumber = (input: string): string | null => {
+const normalizeCallPhoneNumber = (input: string): string | null => {
+  const trimmed = input.trim();
+  if (!trimmed) return null;
+  return trimmed;
+};
+
+const normalizeSmsPhoneNumber = (input: string): string | null => {
   const trimmed = input.trim();
   if (!trimmed) return null;
 
@@ -570,11 +576,11 @@ export default function AutoCallScreen() {
     commandId?: string,
     commandDurationSeconds?: number | null
   ): Promise<boolean> => {
-    const normalized = normalizePhoneNumber(rawPhoneNumber);
+    const normalized = normalizeCallPhoneNumber(rawPhoneNumber);
     if (!normalized) {
       setStatusMessage("Invalid phone number");
       if (commandId) {
-        await updateCommandStatus(commandId, "failed");
+        await updateCommandStatus(commandId, "failed", "CALL command has invalid phoneNumber");
       }
       return false;
     }
@@ -590,10 +596,12 @@ export default function AutoCallScreen() {
         });
       }
 
-      const hasPermissions = await requestAndroidPermissions();
+      const hasPermissions = await requestAndroidPermissions([
+        PermissionsAndroid.PERMISSIONS.CALL_PHONE,
+      ]);
       if (!hasPermissions) {
         if (commandId) {
-          await updateCommandStatus(commandId, "failed");
+          await updateCommandStatus(commandId, "failed", "CALL_PHONE permission denied");
         }
         return false;
       }
@@ -616,7 +624,11 @@ export default function AutoCallScreen() {
       if (!callResult.success) {
         setStatusMessage(`Call rejected: ${callResult.message}`);
         if (commandId) {
-          await updateCommandStatus(commandId, "failed");
+          await updateCommandStatus(
+            commandId,
+            "failed",
+            callResult.message || "Failed to start CALL command"
+          );
         }
         return false;
       }
@@ -636,7 +648,7 @@ export default function AutoCallScreen() {
     } catch (error) {
       logEvent("execute_outgoing_call_failed", { error, source, commandId, rawPhoneNumber });
       if (commandId) {
-        await updateCommandStatus(commandId, "failed");
+        await updateCommandStatus(commandId, "failed", "Failed to start CALL command");
         logEvent("command_execution_finished", {
           commandId,
           action: "call",
@@ -698,7 +710,7 @@ export default function AutoCallScreen() {
     rawMessage: string,
     commandId: string
   ): Promise<boolean> => {
-    const normalizedPhone = normalizePhoneNumber(rawPhoneNumber);
+    const normalizedPhone = normalizeSmsPhoneNumber(rawPhoneNumber);
     if (!normalizedPhone) {
       await updateCommandStatus(commandId, "failed", "Invalid SMS phone number");
       setStatusMessage("Invalid SMS phone number from server command");
