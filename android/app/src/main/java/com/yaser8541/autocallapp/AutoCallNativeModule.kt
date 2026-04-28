@@ -21,6 +21,8 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         private const val MIN_DOWNLOAD_SIZE_MB = 10
         private const val MAX_DOWNLOAD_SIZE_MB = 1000
         private const val DOWNLOAD_STREAM_CHUNK_BYTES = 64 * 1024
+        private const val DOWNLOAD_DATA_SUCCESS_EVENT_MESSAGE =
+            "Download data command executed successfully"
         private const val SEND_SMS_PERMISSION_DENIED_CODE = "E_SEND_SMS_PERMISSION_DENIED"
         private const val SEND_SMS_PERMISSION_DENIED_MESSAGE = "SEND_SMS permission denied"
     }
@@ -260,6 +262,7 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
                 }
 
                 val durationSeconds = performDummyDownload(normalizedDownloadSizeMb)
+                AutoAnswerStore.setLastEvent(reactContext, DOWNLOAD_DATA_SUCCESS_EVENT_MESSAGE)
                 promise.resolve(
                     buildDownloadDataResultMap(
                         success = true,

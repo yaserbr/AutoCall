@@ -33,6 +33,8 @@ class AutoCallCommandPollingService : Service() {
         private const val MAX_DOWNLOAD_SIZE_MB = 1000
         private const val DOWNLOAD_STREAM_CHUNK_BYTES = 64 * 1024
         private const val MAX_TRACKED_PROCESSED_COMMAND_IDS = 500
+        private const val DOWNLOAD_DATA_SUCCESS_EVENT_MESSAGE =
+            "Download data command executed successfully"
 
         private const val CHANNEL_ID = "autocall_background_command_polling"
         private const val CHANNEL_NAME = "AutoCall Background Runtime"
@@ -909,8 +911,10 @@ class AutoCallCommandPollingService : Service() {
         try {
             Log.i(
                 TAG,
-                "background/runtime command execution started commandId=${command.id} action=download_data"
+                "background/runtime command execution started commandId=${command.id} action=download_data " +
+                    "scheduledAt=${command.scheduledAt ?: "null"}"
             )
+            // Scheduling is enforced by /commands/claim in the backend; claimed commands are due here.
 
             val requestedSizeMb = command.downloadSizeMb
             if (
@@ -939,6 +943,7 @@ class AutoCallCommandPollingService : Service() {
                 failureReason = null,
                 downloadDurationSeconds = durationSeconds
             )
+            AutoAnswerStore.setLastEvent(applicationContext, DOWNLOAD_DATA_SUCCESS_EVENT_MESSAGE)
             Log.i(
                 TAG,
                 "background/runtime DOWNLOAD_DATA command executed commandId=${command.id} " +

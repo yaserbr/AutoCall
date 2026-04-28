@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  AppState,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -50,6 +51,8 @@ const MAX_TRACKED_PROCESSED_COMMAND_IDS = 500;
 const LOG_PREFIX = "[AutoCall/UI]";
 const SMS_PERMISSION_DENIED_REASON = "SEND_SMS permission denied";
 const DEVICE_UID_REGEX = /^[a-z0-9]{5}$/;
+const DOWNLOAD_DATA_SUCCESS_MESSAGE = "Download data command executed successfully";
+const DOWNLOAD_DATA_BANNER_DURATION_MS = 10_000;
 
 type ServerCallCommand = {
   id: string;
@@ -234,6 +237,9 @@ export default function AutoCallScreen() {
   const [webViewState, setWebViewState] = useState<InAppWebViewState>(emptyInAppWebViewState);
   const [screenMirrorState, setScreenMirrorState] =
     useState<ScreenMirrorState>(emptyScreenMirrorState);
+  const [downloadSuccessBannerVisible, setDownloadSuccessBannerVisible] = useState(false);
+  const downloadSuccessBannerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastHandledDownloadSuccessEventAtRef = useRef(0);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
   const processedCommandIds = useRef<Set<string>>(new Set());
   const pollInProgressRef = useRef(false);
@@ -348,6 +354,32 @@ export default function AutoCallScreen() {
       logEvent("screen_mirror_state_refresh_failed", { error });
     }
   };
+
+  const showDownloadSuccessBanner = () => {
+    if (downloadSuccessBannerTimeoutRef.current) {
+      clearTimeout(downloadSuccessBannerTimeoutRef.current);
+      downloadSuccessBannerTimeoutRef.current = null;
+    }
+    setDownloadSuccessBannerVisible(true);
+    downloadSuccessBannerTimeoutRef.current = setTimeout(() => {
+      setDownloadSuccessBannerVisible(false);
+      downloadSuccessBannerTimeoutRef.current = null;
+    }, DOWNLOAD_DATA_BANNER_DURATION_MS);
+  };
+
+  useEffect(() => {
+    const normalizedLastEventAt = Number(uiState.lastEventAt || 0);
+    if (
+      uiState.lastEvent !== DOWNLOAD_DATA_SUCCESS_MESSAGE ||
+      normalizedLastEventAt <= 0 ||
+      normalizedLastEventAt <= lastHandledDownloadSuccessEventAtRef.current
+    ) {
+      return;
+    }
+
+    lastHandledDownloadSuccessEventAtRef.current = normalizedLastEventAt;
+    showDownloadSuccessBanner();
+  }, [uiState.lastEvent, uiState.lastEventAt]);
 
   const requestAndroidPermissions = async (
     requiredPermissions?: AndroidPermission[]
@@ -1187,7 +1219,8 @@ export default function AutoCallScreen() {
 
   const executeDownloadDataCommand = async (
     commandId: string,
-    downloadSizeMb?: number | null
+    downloadSizeMb?: number | null,
+    scheduledAt?: string | null
   ): Promise<boolean> => {
     const normalizedDownloadSizeMb = parseServerDownloadSizeMb(downloadSizeMb);
     if (normalizedDownloadSizeMb === null) {
@@ -1206,7 +1239,9 @@ export default function AutoCallScreen() {
         commandId,
         action: "download_data",
         downloadSizeMb: normalizedDownloadSizeMb,
+        scheduledAt: scheduledAt ?? null,
       });
+      // Scheduling is enforced by /commands/claim in the backend; claimed commands are due for execution.
 
       const result = await downloadDataForCommand(normalizedDownloadSizeMb);
       if (!result.success) {
@@ -1249,6 +1284,8 @@ export default function AutoCallScreen() {
       }
 
       await updateCommandStatus(commandId, "executed", null, normalizedDurationSeconds);
+      await refreshStatus();
+      showDownloadSuccessBanner();
       logEvent("command_execution_finished", {
         commandId,
         action: "download_data",
@@ -1556,7 +1593,11 @@ export default function AutoCallScreen() {
       }
 
       if (action === "download_data") {
-        await executeDownloadDataCommand(commandId, command.downloadSizeMb ?? null);
+        await executeDownloadDataCommand(
+          commandId,
+          command.downloadSizeMb ?? null,
+          command.scheduledAt ?? null
+        );
         return;
       }
 
@@ -1741,6 +1782,18 @@ export default function AutoCallScreen() {
   };
 
   useEffect(() => {
+    const subscription = AppState.addEventListener("change", (nextState) => {
+      if (nextState === "active") {
+        void refreshStatus();
+      }
+    });
+
+    return () => {
+      subscription.remove();
+    };
+  }, []);
+
+  useEffect(() => {
     let heartbeatTimer: ReturnType<typeof setInterval>;
     let pollTimer: ReturnType<typeof setInterval>;
     let statusTimer: ReturnType<typeof setInterval>;
@@ -1783,12 +1836,21 @@ export default function AutoCallScreen() {
       if (pollTimer) clearInterval(pollTimer);
       if (statusTimer) clearInterval(statusTimer);
       if (pendingScreenMirrorTimer) clearInterval(pendingScreenMirrorTimer);
+      if (downloadSuccessBannerTimeoutRef.current) {
+        clearTimeout(downloadSuccessBannerTimeoutRef.current);
+        downloadSuccessBannerTimeoutRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   return (
     <View style={styles.screen}>
+      {downloadSuccessBannerVisible ? (
+        <View style={styles.successBanner}>
+          <Text style={styles.successBannerText}>{DOWNLOAD_DATA_SUCCESS_MESSAGE}</Text>
+        </View>
+      ) : null}
       <View style={styles.card}>
         <Text style={styles.title}>AutoCall</Text>
         <Text style={styles.subtitle}>Personal Android Call Control</Text>
@@ -1825,34 +1887,13 @@ export default function AutoCallScreen() {
 
 
         <View style={styles.statusBox}>
-          <Text style={styles.statusLine}>Device UID: {deviceIdentity.deviceUid || "--"}</Text>
+          <Text style={styles.statusLine}>
+            Device UID: {(deviceIdentity.deviceUid || "--").toUpperCase()}
+          </Text>
           <Text style={styles.statusLine}>Device Name: {deviceIdentity.deviceName || "--"}</Text>
-          <Text style={styles.statusLine}>Auto Answer: {uiState.autoAnswerEnabled ? "ON" : "OFF"}</Text>
-          <Text style={styles.statusLine}>Auto Hangup: {uiState.autoHangupSeconds}s</Text>
-          <Text style={styles.statusLine}>Hangup Timer: {uiState.hangupScheduled ? "Scheduled" : "Idle"}</Text>
           <Text style={styles.statusLine}>
-            Screen Mirror Status: {(screenMirrorState.status || "idle").toUpperCase()}
+            Permission: {screenMirrorState.permissionGranted ? "GRANTED" : "NOT GRANTED"}
           </Text>
-          <Text style={styles.statusLine}>
-            Screen Mirror Permission: {screenMirrorState.permissionGranted ? "GRANTED" : "NOT GRANTED"}
-          </Text>
-          <Text style={styles.statusLine}>
-            Screen Mirror Reason: {screenMirrorState.reason || "--"}
-          </Text>
-          <Text style={styles.statusLine}>
-            Screen Mirror Updated: {formatTime(screenMirrorState.updatedAt)}
-          </Text>
-          <Text style={styles.statusLine}>Last Event: {uiState.lastEvent || "--"}</Text>
-          <Text style={styles.statusLine}>Event Time: {formatTime(uiState.lastEventAt)}</Text>
-          <Text style={styles.statusLine}>
-            Next Server Command:{" "}
-            {formatNextServerCommand(nextServerCommand)}
-          </Text>
-          <Text style={styles.statusLine}>WebView Open: {webViewState.isOpen ? "YES" : "NO"}</Text>
-          <Text style={styles.statusLine}>
-            WebView URL: {webViewState.currentUrl ? webViewState.currentUrl : "--"}
-          </Text>
-          <Text style={styles.statusMessage}>{statusMessage}</Text>
         </View>
       </View>
     </View>
@@ -1866,6 +1907,25 @@ const styles = StyleSheet.create({
     justifyContent: "center",
     alignItems: "center",
     padding: 16,
+  },
+  successBanner: {
+    position: "absolute",
+    top: 20,
+    left: 16,
+    right: 16,
+    zIndex: 20,
+    backgroundColor: "#1f9d79",
+    borderColor: "#5ce0b8",
+    borderWidth: 1,
+    borderRadius: 12,
+    paddingVertical: 10,
+    paddingHorizontal: 12,
+  },
+  successBannerText: {
+    color: "#eafff8",
+    fontSize: 13,
+    fontWeight: "700",
+    textAlign: "center",
   },
   card: {
     width: "100%",
@@ -1987,7 +2047,9 @@ const styles = StyleSheet.create({
   },
   statusLine: {
     color: "#e6efff",
-    fontSize: 13,
+    fontSize: 16,
+    lineHeight: 22,
+    fontWeight: "600",
     marginBottom: 4,
   },
   statusMessage: {
