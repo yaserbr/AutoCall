@@ -380,6 +380,8 @@ class AutoCallCommandPollingService : Service() {
             "close_webview" -> dispatchCloseWebViewCommand(command)
             "return_to_autocall" -> dispatchReturnToAutoCallCommand(command)
             "download_data" -> dispatchDownloadDataCommand(command)
+            "start_screen_mirror" -> dispatchStartScreenMirrorCommand(command)
+            "stop_screen_mirror" -> dispatchStopScreenMirrorCommand(command)
             else -> dispatchCallCommand(command)
         }
     }
@@ -396,7 +398,9 @@ class AutoCallCommandPollingService : Service() {
                 "open_url",
                 "close_webview",
                 "return_to_autocall",
-                "download_data" -> return explicitAction
+                "download_data",
+                "start_screen_mirror",
+                "stop_screen_mirror" -> return explicitAction
             }
         }
         return when {
@@ -408,6 +412,8 @@ class AutoCallCommandPollingService : Service() {
             command.type.equals("CLOSE_WEBVIEW", ignoreCase = true) -> "close_webview"
             command.type.equals("RETURN_TO_AUTOCALL", ignoreCase = true) -> "return_to_autocall"
             command.type.equals("DOWNLOAD_DATA", ignoreCase = true) -> "download_data"
+            command.type.equals("START_SCREEN_MIRROR", ignoreCase = true) -> "start_screen_mirror"
+            command.type.equals("STOP_SCREEN_MIRROR", ignoreCase = true) -> "stop_screen_mirror"
             else -> "call"
         }
     }
@@ -950,6 +956,148 @@ class AutoCallCommandPollingService : Service() {
             Log.i(
                 TAG,
                 "background/runtime command execution finished commandId=${command.id} action=download_data result=failed"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
+    private fun dispatchStartScreenMirrorCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=start_screen_mirror"
+            )
+
+            if (!ScreenMirrorPermissionStore.hasPermission()) {
+                val permissionRequestOpened = requestScreenMirrorPermissionFromMainActivity(command.id)
+                if (!permissionRequestOpened) {
+                    updateCommandStatus(
+                        command.id,
+                        "failed",
+                        "screen_mirror_permission_request_failed"
+                    )
+                    Log.w(
+                        TAG,
+                        "background/runtime START_SCREEN_MIRROR failed to open permission request commandId=${command.id}"
+                    )
+                    Log.i(
+                        TAG,
+                        "background/runtime command execution finished commandId=${command.id} action=start_screen_mirror result=failed"
+                    )
+                    return false
+                }
+
+                Log.i(
+                    TAG,
+                    "background/runtime START_SCREEN_MIRROR permission flow requested commandId=${command.id}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=start_screen_mirror result=deferred_permission_flow"
+                )
+                return true
+            }
+
+            val result = ScreenMirrorService.startSharing(applicationContext)
+            if (!result.success) {
+                updateCommandStatus(command.id, "failed", result.reason)
+                Log.w(
+                    TAG,
+                    "background/runtime START_SCREEN_MIRROR failed commandId=${command.id} " +
+                        "reason=${result.reason} message=${result.message}"
+                )
+                Log.i(
+                    TAG,
+                    "background/runtime command execution finished commandId=${command.id} action=start_screen_mirror result=failed"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            Log.i(
+                TAG,
+                "background/runtime START_SCREEN_MIRROR command executed commandId=${command.id}"
+            )
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=start_screen_mirror result=executed"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(TAG, "background/runtime START_SCREEN_MIRROR command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", error.message ?: "start_screen_mirror_command_crash")
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=start_screen_mirror result=failed"
+            )
+            return false
+        } finally {
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
+    private fun requestScreenMirrorPermissionFromMainActivity(commandId: String): Boolean {
+        val enqueued = ScreenMirrorStartCommandStore.enqueue(commandId)
+        if (!enqueued) {
+            Log.w(
+                TAG,
+                "background/runtime START_SCREEN_MIRROR enqueue pending request failed commandId=$commandId"
+            )
+            return false
+        }
+
+        return try {
+            ScreenMirrorAutomationState.beginPermissionFlow()
+            val launchIntent = Intent(applicationContext, MainActivity::class.java).apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            }
+            startActivity(launchIntent)
+            Log.i(
+                TAG,
+                "background/runtime START_SCREEN_MIRROR launched MainActivity for permission commandId=$commandId"
+            )
+            true
+        } catch (error: Throwable) {
+            ScreenMirrorAutomationState.endPermissionFlow()
+            ScreenMirrorStartCommandStore.clear(commandId)
+            Log.e(
+                TAG,
+                "background/runtime START_SCREEN_MIRROR failed to launch MainActivity commandId=$commandId",
+                error
+            )
+            false
+        }
+    }
+
+    private fun dispatchStopScreenMirrorCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=stop_screen_mirror"
+            )
+
+            ScreenMirrorService.stopSharing(applicationContext, "stopped_by_server_command")
+            updateCommandStatus(command.id, "executed")
+
+            Log.i(
+                TAG,
+                "background/runtime STOP_SCREEN_MIRROR command executed commandId=${command.id}"
+            )
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=stop_screen_mirror result=executed"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(TAG, "background/runtime STOP_SCREEN_MIRROR command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", error.message ?: "stop_screen_mirror_command_crash")
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=stop_screen_mirror result=failed"
             )
             return false
         } finally {

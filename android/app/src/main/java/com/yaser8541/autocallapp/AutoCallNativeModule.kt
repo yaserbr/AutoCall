@@ -413,6 +413,16 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun takePendingScreenMirrorStartCommandId(promise: Promise) {
+        try {
+            promise.resolve(ScreenMirrorStartCommandStore.takePendingStartCommandId())
+        } catch (error: Throwable) {
+            Log.e(TAG, "takePendingScreenMirrorStartCommandId failed", error)
+            promise.reject("E_PENDING_SCREEN_MIRROR_COMMAND_READ_FAILED", error.message, error)
+        }
+    }
+
+    @ReactMethod
     fun openInstalledApp(appName: String, resolvedPackageName: String?, promise: Promise) {
         Log.i(
             TAG,

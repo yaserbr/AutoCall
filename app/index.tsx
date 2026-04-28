@@ -27,7 +27,15 @@ import {
   startSimpleCall,
   startServerCommandCall,
   startServerCommandSms,
+  takePendingScreenMirrorStartCommandId,
 } from "../src/native/autoCallNative";
+import {
+  getScreenMirrorState,
+  requestScreenMirrorPermission,
+  startScreenMirrorFromCommand,
+  stopScreenMirroring,
+  type ScreenMirrorState,
+} from "../src/native/screenMirrorNative";
 
 const SERVER = "https://serverautocall-production.up.railway.app";
 const POLL_INTERVAL_MS = 10000;
@@ -55,7 +63,9 @@ type ServerCallCommand = {
     | "close_webview"
     | "open_app"
     | "return_to_autocall"
-    | "download_data";
+    | "download_data"
+    | "start_screen_mirror"
+    | "stop_screen_mirror";
   type:
     | "CALL"
     | "END"
@@ -65,7 +75,9 @@ type ServerCallCommand = {
     | "CLOSE_WEBVIEW"
     | "OPEN_APP"
     | "RETURN_TO_AUTOCALL"
-    | "DOWNLOAD_DATA";
+    | "DOWNLOAD_DATA"
+    | "START_SCREEN_MIRROR"
+    | "STOP_SCREEN_MIRROR";
   phoneNumber?: string | null;
   message?: string | null;
   url?: string | null;
@@ -109,7 +121,9 @@ type ServerCommandAction =
   | "close_webview"
   | "open_app"
   | "return_to_autocall"
-  | "download_data";
+  | "download_data"
+  | "start_screen_mirror"
+  | "stop_screen_mirror";
 
 const emptyState: UiState = {
   autoAnswerEnabled: false,
@@ -122,6 +136,14 @@ const emptyState: UiState = {
 const emptyInAppWebViewState: InAppWebViewState = {
   isOpen: false,
   currentUrl: null,
+};
+
+const emptyScreenMirrorState: ScreenMirrorState = {
+  status: "idle",
+  reason: null,
+  permissionGranted: false,
+  isSharing: false,
+  updatedAt: 0,
 };
 
 const logEvent = (event: string, payload?: unknown) => {
@@ -210,9 +232,12 @@ export default function AutoCallScreen() {
   );
   const [nextServerCommand, setNextServerCommand] = useState<ServerCallCommand | null>(null);
   const [webViewState, setWebViewState] = useState<InAppWebViewState>(emptyInAppWebViewState);
+  const [screenMirrorState, setScreenMirrorState] =
+    useState<ScreenMirrorState>(emptyScreenMirrorState);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
   const processedCommandIds = useRef<Set<string>>(new Set());
   const pollInProgressRef = useRef(false);
+  const screenMirrorPendingCommandProcessingRef = useRef(false);
   const deviceUidRef = useRef<string>("");
   const deviceNameRef = useRef<string>("");
 
@@ -311,6 +336,16 @@ export default function AutoCallScreen() {
       logEvent("webview_state_refresh", snapshot);
     } catch (error) {
       logEvent("webview_state_refresh_failed", { error });
+    }
+  };
+
+  const refreshScreenMirrorState = async () => {
+    try {
+      const snapshot = await getScreenMirrorState();
+      setScreenMirrorState(snapshot);
+      logEvent("screen_mirror_state_refresh", snapshot);
+    } catch (error) {
+      logEvent("screen_mirror_state_refresh_failed", { error });
     }
   };
 
@@ -1240,6 +1275,179 @@ export default function AutoCallScreen() {
     }
   };
 
+  const executeStartScreenMirrorCommand = async (commandId: string): Promise<boolean> => {
+    try {
+      inFlightCommandIds.current.add(commandId);
+      logEvent("command_execution_started", { commandId, action: "start_screen_mirror" });
+
+      const stateBeforeStart = await getScreenMirrorState();
+      if (!stateBeforeStart.permissionGranted) {
+        const permissionResult = await requestScreenMirrorPermission();
+        await refreshScreenMirrorState();
+
+        if (!permissionResult.success) {
+          const permissionFailureReasonRaw =
+            typeof permissionResult.reason === "string" && permissionResult.reason.trim()
+              ? permissionResult.reason.trim()
+              : "screen_mirror_permission_not_granted";
+          const permissionFailureReason =
+            permissionFailureReasonRaw === "screen_mirror_activity_unavailable"
+              ? "screen_mirror_permission_request_failed"
+              : permissionFailureReasonRaw;
+          await updateCommandStatus(commandId, "failed", permissionFailureReason);
+          logEvent("command_execution_finished", {
+            commandId,
+            action: "start_screen_mirror",
+            result: "failed",
+            reason: permissionFailureReason,
+            message: permissionResult.message,
+          });
+          setStatusMessage(`START_SCREEN_MIRROR failed: ${permissionResult.message}`);
+          return false;
+        }
+
+        const stateAfterPermission = await getScreenMirrorState();
+        if (!stateAfterPermission.permissionGranted) {
+          await updateCommandStatus(commandId, "failed", "screen_mirror_permission_not_granted");
+          logEvent("command_execution_finished", {
+            commandId,
+            action: "start_screen_mirror",
+            result: "failed",
+            reason: "screen_mirror_permission_not_granted",
+          });
+          setStatusMessage("START_SCREEN_MIRROR failed: permission not granted");
+          return false;
+        }
+      } else {
+        await refreshScreenMirrorState();
+      }
+
+      const stateReady = await getScreenMirrorState();
+      if (!stateReady.permissionGranted) {
+        await updateCommandStatus(commandId, "failed", "screen_mirror_permission_not_granted");
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "start_screen_mirror",
+          result: "failed",
+          reason: "screen_mirror_permission_not_granted",
+        });
+        setStatusMessage("START_SCREEN_MIRROR failed: permission not granted");
+        return false;
+      }
+
+      const result = await startScreenMirrorFromCommand();
+      if (!result.success) {
+        const failureReason =
+          typeof result.reason === "string" && result.reason.trim()
+            ? result.reason.trim()
+            : "start_screen_mirror_failed";
+        await updateCommandStatus(commandId, "failed", failureReason);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "start_screen_mirror",
+          result: "failed",
+          reason: failureReason,
+          message: result.message,
+        });
+        setStatusMessage(`START_SCREEN_MIRROR failed: ${result.message}`);
+        await refreshScreenMirrorState();
+        return false;
+      }
+
+      await updateCommandStatus(commandId, "executed");
+      await refreshScreenMirrorState();
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "start_screen_mirror",
+        result: "executed",
+      });
+      setStatusMessage("START_SCREEN_MIRROR executed");
+      return true;
+    } catch (error) {
+      logEvent("execute_start_screen_mirror_command_failed", { error, commandId });
+      await updateCommandStatus(commandId, "failed", "start_screen_mirror_command_crash");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "start_screen_mirror",
+        result: "failed",
+      });
+      setStatusMessage("Failed to execute START_SCREEN_MIRROR command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
+  const processPendingScreenMirrorStartCommand = async () => {
+    if (screenMirrorPendingCommandProcessingRef.current) {
+      return;
+    }
+    screenMirrorPendingCommandProcessingRef.current = true;
+    try {
+      const pendingCommandIdRaw = await takePendingScreenMirrorStartCommandId();
+      const commandId =
+        typeof pendingCommandIdRaw === "string" ? pendingCommandIdRaw.trim() : "";
+      if (!commandId) {
+        return;
+      }
+      rememberProcessedCommandId(commandId);
+      logEvent("pending_screen_mirror_command_received", { commandId });
+      await executeStartScreenMirrorCommand(commandId);
+    } catch (error) {
+      logEvent("pending_screen_mirror_command_processing_failed", { error });
+    } finally {
+      screenMirrorPendingCommandProcessingRef.current = false;
+    }
+  };
+
+  const executeStopScreenMirrorCommand = async (commandId: string): Promise<boolean> => {
+    try {
+      inFlightCommandIds.current.add(commandId);
+      logEvent("command_execution_started", { commandId, action: "stop_screen_mirror" });
+
+      const result = await stopScreenMirroring("stopped_by_server_command");
+      if (!result.success) {
+        const failureReason =
+          typeof result.reason === "string" && result.reason.trim()
+            ? result.reason.trim()
+            : "stop_screen_mirror_failed";
+        await updateCommandStatus(commandId, "failed", failureReason);
+        logEvent("command_execution_finished", {
+          commandId,
+          action: "stop_screen_mirror",
+          result: "failed",
+          reason: failureReason,
+          message: result.message,
+        });
+        setStatusMessage(`STOP_SCREEN_MIRROR failed: ${result.message}`);
+        await refreshScreenMirrorState();
+        return false;
+      }
+
+      await updateCommandStatus(commandId, "executed");
+      await refreshScreenMirrorState();
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "stop_screen_mirror",
+        result: "executed",
+      });
+      setStatusMessage("STOP_SCREEN_MIRROR executed");
+      return true;
+    } catch (error) {
+      logEvent("execute_stop_screen_mirror_command_failed", { error, commandId });
+      await updateCommandStatus(commandId, "failed", "stop_screen_mirror_command_crash");
+      logEvent("command_execution_finished", {
+        commandId,
+        action: "stop_screen_mirror",
+        result: "failed",
+      });
+      setStatusMessage("Failed to execute STOP_SCREEN_MIRROR command");
+      return false;
+    } finally {
+      inFlightCommandIds.current.delete(commandId);
+    }
+  };
+
   const resolveCommandAction = (
     command: ServerCallCommand
   ): ServerCommandAction => {
@@ -1253,7 +1461,9 @@ export default function AutoCallScreen() {
       explicitAction === "close_webview" ||
       explicitAction === "open_app" ||
       explicitAction === "return_to_autocall" ||
-      explicitAction === "download_data"
+      explicitAction === "download_data" ||
+      explicitAction === "start_screen_mirror" ||
+      explicitAction === "stop_screen_mirror"
     ) {
       return explicitAction;
     }
@@ -1266,6 +1476,8 @@ export default function AutoCallScreen() {
     if (command.type === "OPEN_APP") return "open_app";
     if (command.type === "RETURN_TO_AUTOCALL") return "return_to_autocall";
     if (command.type === "DOWNLOAD_DATA") return "download_data";
+    if (command.type === "START_SCREEN_MIRROR") return "start_screen_mirror";
+    if (command.type === "STOP_SCREEN_MIRROR") return "stop_screen_mirror";
     return "call";
   };
 
@@ -1348,6 +1560,16 @@ export default function AutoCallScreen() {
         return;
       }
 
+      if (action === "start_screen_mirror") {
+        await executeStartScreenMirrorCommand(commandId);
+        return;
+      }
+
+      if (action === "stop_screen_mirror") {
+        await executeStopScreenMirrorCommand(commandId);
+        return;
+      }
+
       if (action === "sms") {
         if (!command.phoneNumber) {
           await updateCommandStatus(commandId, "failed", "SMS command missing phoneNumber");
@@ -1421,6 +1643,14 @@ export default function AutoCallScreen() {
       return "DOWNLOAD_DATA";
     }
 
+    if (command.type === "START_SCREEN_MIRROR") {
+      return "START_SCREEN_MIRROR";
+    }
+
+    if (command.type === "STOP_SCREEN_MIRROR") {
+      return "STOP_SCREEN_MIRROR";
+    }
+
     return `${command.type}${command.phoneNumber ? ` (${command.phoneNumber})` : ""}`;
   };
 
@@ -1480,16 +1710,49 @@ export default function AutoCallScreen() {
     }
   };
 
+  const onEnableScreenMirroring = async () => {
+    try {
+      const result = await requestScreenMirrorPermission();
+      await refreshScreenMirrorState();
+      if (result.success) {
+        setStatusMessage("Screen mirror permission enabled");
+      } else {
+        setStatusMessage(`Screen mirror permission failed: ${result.message}`);
+      }
+    } catch (error) {
+      logEvent("enable_screen_mirror_permission_failed", { error });
+      setStatusMessage("Failed to enable screen mirror permission");
+    }
+  };
+
+  const onStopScreenMirroring = async () => {
+    try {
+      const result = await stopScreenMirroring("stopped_by_user");
+      await refreshScreenMirrorState();
+      if (result.success) {
+        setStatusMessage("Screen sharing stopped");
+      } else {
+        setStatusMessage(`Stop sharing failed: ${result.message}`);
+      }
+    } catch (error) {
+      logEvent("stop_screen_mirroring_failed", { error });
+      setStatusMessage("Failed to stop screen sharing");
+    }
+  };
+
   useEffect(() => {
     let heartbeatTimer: ReturnType<typeof setInterval>;
     let pollTimer: ReturnType<typeof setInterval>;
     let statusTimer: ReturnType<typeof setInterval>;
+    let pendingScreenMirrorTimer: ReturnType<typeof setInterval>;
 
     const init = async () => {
       await requestAndroidPermissions();
       await refreshDeviceIdentity();
       await refreshStatus();
       await refreshInAppWebViewState();
+      await refreshScreenMirrorState();
+      await processPendingScreenMirrorStartCommand();
       await registerDevice();
       await sendHeartbeat();
       await pollCommands();
@@ -1505,7 +1768,12 @@ export default function AutoCallScreen() {
       statusTimer = setInterval(() => {
         void refreshStatus();
         void refreshInAppWebViewState();
+        void refreshScreenMirrorState();
       }, 3000);
+
+      pendingScreenMirrorTimer = setInterval(() => {
+        void processPendingScreenMirrorStartCommand();
+      }, 1000);
     };
 
     void init();
@@ -1514,6 +1782,7 @@ export default function AutoCallScreen() {
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       if (pollTimer) clearInterval(pollTimer);
       if (statusTimer) clearInterval(statusTimer);
+      if (pendingScreenMirrorTimer) clearInterval(pendingScreenMirrorTimer);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1546,6 +1815,14 @@ export default function AutoCallScreen() {
           </View>
         </View>
 
+        <View style={styles.section}>
+          <View style={styles.row}>
+            <Pressable style={styles.primaryButton} onPress={onEnableScreenMirroring}>
+              <Text style={styles.primaryButtonText}>Enable Screen Mirroring</Text>
+            </Pressable>
+          </View>
+        </View>
+
 
         <View style={styles.statusBox}>
           <Text style={styles.statusLine}>Device UID: {deviceIdentity.deviceUid || "--"}</Text>
@@ -1553,6 +1830,18 @@ export default function AutoCallScreen() {
           <Text style={styles.statusLine}>Auto Answer: {uiState.autoAnswerEnabled ? "ON" : "OFF"}</Text>
           <Text style={styles.statusLine}>Auto Hangup: {uiState.autoHangupSeconds}s</Text>
           <Text style={styles.statusLine}>Hangup Timer: {uiState.hangupScheduled ? "Scheduled" : "Idle"}</Text>
+          <Text style={styles.statusLine}>
+            Screen Mirror Status: {(screenMirrorState.status || "idle").toUpperCase()}
+          </Text>
+          <Text style={styles.statusLine}>
+            Screen Mirror Permission: {screenMirrorState.permissionGranted ? "GRANTED" : "NOT GRANTED"}
+          </Text>
+          <Text style={styles.statusLine}>
+            Screen Mirror Reason: {screenMirrorState.reason || "--"}
+          </Text>
+          <Text style={styles.statusLine}>
+            Screen Mirror Updated: {formatTime(screenMirrorState.updatedAt)}
+          </Text>
           <Text style={styles.statusLine}>Last Event: {uiState.lastEvent || "--"}</Text>
           <Text style={styles.statusLine}>Event Time: {formatTime(uiState.lastEventAt)}</Text>
           <Text style={styles.statusLine}>

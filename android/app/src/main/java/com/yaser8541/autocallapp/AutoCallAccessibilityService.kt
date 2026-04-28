@@ -5,6 +5,8 @@ import android.accessibilityservice.GestureDescription
 import android.app.ActivityManager
 import android.graphics.Path
 import android.graphics.Rect
+import android.os.Handler
+import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
 import android.view.accessibility.AccessibilityEvent
@@ -24,6 +26,13 @@ class AutoCallAccessibilityService : AccessibilityService() {
         private const val GESTURE_DURATION_MS = 40L
         private const val GESTURE_WAIT_MS = 700L
         private const val MAX_NODE_SCAN_PER_ROOT = 650
+        private const val SCREEN_MIRROR_SYSTEMUI_PACKAGE = "com.android.systemui"
+        private const val SCREEN_MIRROR_RETRY_INTERVAL_MS = 250L
+        private const val SCREEN_MIRROR_TIMEOUT_MS = 4000L
+        private const val SCREEN_MIRROR_TEXT_SHARE_ONE_APP = "Share one app"
+        private const val SCREEN_MIRROR_TEXT_SHARE_ENTIRE_SCREEN = "Share entire screen"
+        private const val SCREEN_MIRROR_TEXT_SHARE_SCREEN = "Share screen"
+        private const val SCREEN_MIRROR_TEXT_NEXT = "Next"
 
         private val VERIFY_CHECKPOINTS_MS = longArrayOf(220L, 480L, 820L, 1120L)
         private val RECENTS_HINTS = listOf(
@@ -118,6 +127,26 @@ class AutoCallAccessibilityService : AccessibilityService() {
 
     @Volatile
     private var lastObservedPackageFromEvents: String? = null
+    private val screenMirrorRetryHandler = Handler(Looper.getMainLooper())
+    private val screenMirrorAutomationRunning = AtomicBoolean(false)
+
+    @Volatile
+    private var screenMirrorDeadlineAtMs = 0L
+
+    @Volatile
+    private var screenMirrorShareOneAppDropdownClicked = false
+
+    @Volatile
+    private var screenMirrorShareEntireScreenSelected = false
+
+    @Volatile
+    private var screenMirrorDetectedLogged = false
+
+    private val screenMirrorRetryRunnable = object : Runnable {
+        override fun run() {
+            runScreenMirrorAutomationStep()
+        }
+    }
 
     override fun onServiceConnected() {
         super.onServiceConnected()
@@ -131,6 +160,7 @@ class AutoCallAccessibilityService : AccessibilityService() {
     }
 
     override fun onDestroy() {
+        stopScreenMirrorAutomation()
         if (connectedService == this) {
             connectedService = null
         }
@@ -143,6 +173,225 @@ class AutoCallAccessibilityService : AccessibilityService() {
         val packageName = event?.packageName?.toString()?.trim()
         if (!packageName.isNullOrBlank()) {
             lastObservedPackageFromEvents = packageName
+        }
+
+        if (!ScreenMirrorAutomationState.isWaitingForPermission) {
+            return
+        }
+        if (!ScreenMirrorAutomationState.isSamsungOneUiTarget()) {
+            return
+        }
+        if (packageName != SCREEN_MIRROR_SYSTEMUI_PACKAGE) {
+            return
+        }
+
+        if (!screenMirrorDetectedLogged) {
+            screenMirrorDetectedLogged = true
+            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] detected")
+        }
+        startScreenMirrorAutomation()
+    }
+
+    private fun startScreenMirrorAutomation() {
+        if (!screenMirrorAutomationRunning.compareAndSet(false, true)) {
+            return
+        }
+        screenMirrorDeadlineAtMs = SystemClock.elapsedRealtime() + SCREEN_MIRROR_TIMEOUT_MS
+        screenMirrorShareOneAppDropdownClicked = false
+        screenMirrorShareEntireScreenSelected = false
+        screenMirrorRetryHandler.removeCallbacks(screenMirrorRetryRunnable)
+        screenMirrorRetryHandler.post(screenMirrorRetryRunnable)
+    }
+
+    private fun stopScreenMirrorAutomation() {
+        screenMirrorRetryHandler.removeCallbacks(screenMirrorRetryRunnable)
+        screenMirrorAutomationRunning.set(false)
+        screenMirrorDeadlineAtMs = 0L
+        screenMirrorShareOneAppDropdownClicked = false
+        screenMirrorShareEntireScreenSelected = false
+        screenMirrorDetectedLogged = false
+    }
+
+    private fun runScreenMirrorAutomationStep() {
+        if (!screenMirrorAutomationRunning.get()) {
+            return
+        }
+        if (!ScreenMirrorAutomationState.isWaitingForPermission) {
+            stopScreenMirrorAutomation()
+            return
+        }
+        if (!ScreenMirrorAutomationState.isSamsungOneUiTarget()) {
+            stopScreenMirrorAutomation()
+            return
+        }
+
+        if (SystemClock.elapsedRealtime() >= screenMirrorDeadlineAtMs) {
+            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] timeout")
+            ScreenMirrorAutomationState.endPermissionFlow()
+            stopScreenMirrorAutomation()
+            return
+        }
+
+        val roots = collectWindowRoots()
+        try {
+            if (!screenMirrorShareOneAppDropdownClicked) {
+                val clickedShareOneAppDropdown = clickByExactText(
+                    roots = roots,
+                    targetText = SCREEN_MIRROR_TEXT_SHARE_ONE_APP
+                )
+                if (clickedShareOneAppDropdown) {
+                    screenMirrorShareOneAppDropdownClicked = true
+                    Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked share one app dropdown")
+                    screenMirrorRetryHandler.postDelayed(
+                        screenMirrorRetryRunnable,
+                        SCREEN_MIRROR_RETRY_INTERVAL_MS
+                    )
+                    return
+                }
+            }
+
+            if (!screenMirrorShareEntireScreenSelected) {
+                val clickedShareEntireScreen = clickByExactText(
+                    roots = roots,
+                    targetText = SCREEN_MIRROR_TEXT_SHARE_ENTIRE_SCREEN
+                )
+                if (clickedShareEntireScreen) {
+                    screenMirrorShareEntireScreenSelected = true
+                    Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] selected share entire screen")
+                    screenMirrorRetryHandler.postDelayed(
+                        screenMirrorRetryRunnable,
+                        SCREEN_MIRROR_RETRY_INTERVAL_MS
+                    )
+                    return
+                }
+            }
+
+            val clickedShareScreen = clickByExactText(
+                roots = roots,
+                targetText = SCREEN_MIRROR_TEXT_SHARE_SCREEN
+            )
+            if (clickedShareScreen) {
+                Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked share screen")
+                ScreenMirrorAutomationState.endPermissionFlow()
+                stopScreenMirrorAutomation()
+                return
+            }
+
+            val clickedNext = clickByExactText(
+                roots = roots,
+                targetText = SCREEN_MIRROR_TEXT_NEXT
+            )
+            if (clickedNext) {
+                ScreenMirrorAutomationState.endPermissionFlow()
+                stopScreenMirrorAutomation()
+                return
+            }
+        } finally {
+            roots.forEach { it.recycle() }
+        }
+
+        screenMirrorRetryHandler.postDelayed(screenMirrorRetryRunnable, SCREEN_MIRROR_RETRY_INTERVAL_MS)
+    }
+
+    private fun clickByExactText(
+        roots: List<AccessibilityNodeInfo>,
+        targetText: String
+    ): Boolean {
+        return clickByExactTexts(roots = roots, targetTexts = listOf(targetText))
+    }
+
+    private fun clickByExactTexts(
+        roots: List<AccessibilityNodeInfo>,
+        targetTexts: List<String>
+    ): Boolean {
+        if (roots.isEmpty() || targetTexts.isEmpty()) {
+            return false
+        }
+        val normalizedTargets = targetTexts
+            .map { normalizeText(it) }
+            .filter { it.isNotBlank() }
+            .toSet()
+        if (normalizedTargets.isEmpty()) {
+            return false
+        }
+
+        for (root in roots) {
+            if (clickTargetInTree(root, normalizedTargets)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun clickTargetInTree(
+        root: AccessibilityNodeInfo,
+        normalizedTargets: Set<String>
+    ): Boolean {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        val visited = mutableListOf<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        var scannedNodes = 0
+        try {
+            while (queue.isNotEmpty() && scannedNodes < MAX_NODE_SCAN_PER_ROOT) {
+                val node = queue.removeFirst()
+                visited.add(node)
+                scannedNodes += 1
+
+                if (isSystemUiNode(node) && nodeMatchesTarget(node, normalizedTargets)) {
+                    if (clickNodeOrAncestor(node)) {
+                        return true
+                    }
+                }
+
+                for (childIndex in 0 until node.childCount) {
+                    node.getChild(childIndex)?.let { child ->
+                        queue.add(child)
+                    }
+                }
+            }
+        } finally {
+            visited.forEach { it.recycle() }
+            while (queue.isNotEmpty()) {
+                queue.removeFirst().recycle()
+            }
+        }
+        return false
+    }
+
+    private fun isSystemUiNode(node: AccessibilityNodeInfo): Boolean {
+        return node.packageName?.toString()?.trim() == SCREEN_MIRROR_SYSTEMUI_PACKAGE
+    }
+
+    private fun nodeMatchesTarget(
+        node: AccessibilityNodeInfo,
+        normalizedTargets: Set<String>
+    ): Boolean {
+        val textValue = normalizeText(node.text?.toString().orEmpty())
+        if (textValue in normalizedTargets) {
+            return true
+        }
+        val descriptionValue = normalizeText(node.contentDescription?.toString().orEmpty())
+        return descriptionValue in normalizedTargets
+    }
+
+    private fun clickNodeOrAncestor(node: AccessibilityNodeInfo): Boolean {
+        if (node.isClickable && node.isEnabled) {
+            return try {
+                node.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            } catch (error: Throwable) {
+                Log.w(TAG, "Failed to click target node", error)
+                false
+            }
+        }
+
+        val clickableAncestor = findClickableAncestor(node) ?: return false
+        return try {
+            clickableAncestor.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+        } catch (error: Throwable) {
+            Log.w(TAG, "Failed to click target ancestor", error)
+            false
+        } finally {
+            clickableAncestor.recycle()
         }
     }
 

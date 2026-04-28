@@ -8,7 +8,8 @@ class DirectCallPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext)
         = listOf(
             DirectCallModule(reactContext),
-            AutoCallNativeModule(reactContext)
+            AutoCallNativeModule(reactContext),
+            ScreenMirrorModule(reactContext)
         )
 
     override fun createViewManagers(reactContext: ReactApplicationContext)

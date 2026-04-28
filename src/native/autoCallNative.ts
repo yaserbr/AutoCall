@@ -95,6 +95,7 @@ type AutoCallNativeModule = {
   openInAppWebView(url: string): Promise<InAppWebViewCommandResult>;
   closeInAppWebView(): Promise<InAppWebViewCommandResult>;
   getInAppWebViewState(): Promise<InAppWebViewState>;
+  takePendingScreenMirrorStartCommandId(): Promise<string | null>;
   openInstalledApp(appName: string, resolvedPackageName: string | null): Promise<OpenInstalledAppResult>;
   returnToAutoCall(): Promise<ReturnToAutoCallResult>;
   downloadDataForCommand(downloadSizeMb: number): Promise<DownloadDataResult>;
@@ -137,6 +138,9 @@ export const openInAppWebView = (url: string) => getNativeModule().openInAppWebV
 export const closeInAppWebView = () => getNativeModule().closeInAppWebView();
 
 export const getInAppWebViewState = () => getNativeModule().getInAppWebViewState();
+
+export const takePendingScreenMirrorStartCommandId = () =>
+  getNativeModule().takePendingScreenMirrorStartCommandId();
 
 export const openInstalledApp = (appName: string, resolvedPackageName?: string | null) =>
   getNativeModule().openInstalledApp(appName, resolvedPackageName ?? null);
