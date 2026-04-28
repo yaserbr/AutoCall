@@ -5,6 +5,7 @@ import android.accessibilityservice.GestureDescription
 import android.app.ActivityManager
 import android.graphics.Path
 import android.graphics.Rect
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -27,12 +28,24 @@ class AutoCallAccessibilityService : AccessibilityService() {
         private const val GESTURE_WAIT_MS = 700L
         private const val MAX_NODE_SCAN_PER_ROOT = 650
         private const val SCREEN_MIRROR_SYSTEMUI_PACKAGE = "com.android.systemui"
+        private const val SCREEN_MIRROR_PERMISSION_CONTROLLER_PACKAGE =
+            "com.google.android.permissioncontroller"
         private const val SCREEN_MIRROR_RETRY_INTERVAL_MS = 250L
-        private const val SCREEN_MIRROR_TIMEOUT_MS = 4000L
-        private const val SCREEN_MIRROR_TEXT_SHARE_ONE_APP = "Share one app"
-        private const val SCREEN_MIRROR_TEXT_SHARE_ENTIRE_SCREEN = "Share entire screen"
-        private const val SCREEN_MIRROR_TEXT_SHARE_SCREEN = "Share screen"
-        private const val SCREEN_MIRROR_TEXT_NEXT = "Next"
+        private const val SCREEN_MIRROR_TIMEOUT_MS = 5000L
+        private const val SCREEN_MIRROR_MANUFACTURER_SAMSUNG = "samsung"
+        private const val SCREEN_MIRROR_MANUFACTURER_MOTOROLA = "motorola"
+
+        private const val SAMSUNG_TEXT_SHARE_ONE_APP = "Share one app"
+        private const val SAMSUNG_TEXT_SHARE_ENTIRE_SCREEN = "Share entire screen"
+        private const val SAMSUNG_TEXT_SHARE_SCREEN = "Share screen"
+        private const val SAMSUNG_TEXT_NEXT = "Next"
+
+        private const val MOTOROLA_DIALOG_TITLE = "Start recording or casting with autocall-app?"
+        private const val MOTOROLA_TEXT_SINGLE_APP = "A single app"
+        private const val MOTOROLA_TEXT_ENTIRE_SCREEN = "Entire screen"
+        private const val MOTOROLA_TEXT_FULL_SCREEN = "Full screen"
+        private const val MOTOROLA_TEXT_WHOLE_SCREEN = "Whole screen"
+        private const val MOTOROLA_TEXT_START = "Start"
 
         private val VERIFY_CHECKPOINTS_MS = longArrayOf(220L, 480L, 820L, 1120L)
         private val RECENTS_HINTS = listOf(
@@ -125,6 +138,12 @@ class AutoCallAccessibilityService : AccessibilityService() {
         val recentsEvidence: String
     )
 
+    private enum class ScreenMirrorPermissionStep {
+        STEP_OPEN_DROPDOWN,
+        STEP_SELECT_ENTIRE_SCREEN,
+        STEP_CONFIRM
+    }
+
     @Volatile
     private var lastObservedPackageFromEvents: String? = null
     private val screenMirrorRetryHandler = Handler(Looper.getMainLooper())
@@ -134,10 +153,13 @@ class AutoCallAccessibilityService : AccessibilityService() {
     private var screenMirrorDeadlineAtMs = 0L
 
     @Volatile
-    private var screenMirrorShareOneAppDropdownClicked = false
+    private var screenMirrorPermissionStep = ScreenMirrorPermissionStep.STEP_OPEN_DROPDOWN
 
     @Volatile
-    private var screenMirrorShareEntireScreenSelected = false
+    private var screenMirrorManufacturer: String? = null
+
+    @Volatile
+    private var motorolaEntireScreenClickCount = 0
 
     @Volatile
     private var screenMirrorDetectedLogged = false
@@ -178,27 +200,30 @@ class AutoCallAccessibilityService : AccessibilityService() {
         if (!ScreenMirrorAutomationState.isWaitingForPermission) {
             return
         }
-        if (!ScreenMirrorAutomationState.isSamsungOneUiTarget()) {
+        val manufacturer = resolveScreenMirrorManufacturer() ?: return
+        if (!isAllowedScreenMirrorPackage(packageName)) {
             return
         }
-        if (packageName != SCREEN_MIRROR_SYSTEMUI_PACKAGE) {
-            return
-        }
-
         if (!screenMirrorDetectedLogged) {
             screenMirrorDetectedLogged = true
             Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] detected")
+            if (manufacturer == SCREEN_MIRROR_MANUFACTURER_SAMSUNG) {
+                Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] manufacturer=samsung")
+            } else if (manufacturer == SCREEN_MIRROR_MANUFACTURER_MOTOROLA) {
+                Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] manufacturer=motorola")
+            }
         }
-        startScreenMirrorAutomation()
+        startScreenMirrorAutomation(manufacturer)
     }
 
-    private fun startScreenMirrorAutomation() {
+    private fun startScreenMirrorAutomation(manufacturer: String) {
         if (!screenMirrorAutomationRunning.compareAndSet(false, true)) {
             return
         }
         screenMirrorDeadlineAtMs = SystemClock.elapsedRealtime() + SCREEN_MIRROR_TIMEOUT_MS
-        screenMirrorShareOneAppDropdownClicked = false
-        screenMirrorShareEntireScreenSelected = false
+        screenMirrorManufacturer = manufacturer
+        screenMirrorPermissionStep = ScreenMirrorPermissionStep.STEP_OPEN_DROPDOWN
+        motorolaEntireScreenClickCount = 0
         screenMirrorRetryHandler.removeCallbacks(screenMirrorRetryRunnable)
         screenMirrorRetryHandler.post(screenMirrorRetryRunnable)
     }
@@ -207,8 +232,9 @@ class AutoCallAccessibilityService : AccessibilityService() {
         screenMirrorRetryHandler.removeCallbacks(screenMirrorRetryRunnable)
         screenMirrorAutomationRunning.set(false)
         screenMirrorDeadlineAtMs = 0L
-        screenMirrorShareOneAppDropdownClicked = false
-        screenMirrorShareEntireScreenSelected = false
+        screenMirrorManufacturer = null
+        screenMirrorPermissionStep = ScreenMirrorPermissionStep.STEP_OPEN_DROPDOWN
+        motorolaEntireScreenClickCount = 0
         screenMirrorDetectedLogged = false
     }
 
@@ -220,10 +246,12 @@ class AutoCallAccessibilityService : AccessibilityService() {
             stopScreenMirrorAutomation()
             return
         }
-        if (!ScreenMirrorAutomationState.isSamsungOneUiTarget()) {
+        val manufacturer = screenMirrorManufacturer ?: resolveScreenMirrorManufacturer()
+        if (manufacturer == null) {
             stopScreenMirrorAutomation()
             return
         }
+        screenMirrorManufacturer = manufacturer
 
         if (SystemClock.elapsedRealtime() >= screenMirrorDeadlineAtMs) {
             Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] timeout")
@@ -234,63 +262,441 @@ class AutoCallAccessibilityService : AccessibilityService() {
 
         val roots = collectWindowRoots()
         try {
-            if (!screenMirrorShareOneAppDropdownClicked) {
-                val clickedShareOneAppDropdown = clickByExactText(
-                    roots = roots,
-                    targetText = SCREEN_MIRROR_TEXT_SHARE_ONE_APP
-                )
-                if (clickedShareOneAppDropdown) {
-                    screenMirrorShareOneAppDropdownClicked = true
-                    Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked share one app dropdown")
-                    screenMirrorRetryHandler.postDelayed(
-                        screenMirrorRetryRunnable,
-                        SCREEN_MIRROR_RETRY_INTERVAL_MS
-                    )
-                    return
-                }
-            }
-
-            if (!screenMirrorShareEntireScreenSelected) {
-                val clickedShareEntireScreen = clickByExactText(
-                    roots = roots,
-                    targetText = SCREEN_MIRROR_TEXT_SHARE_ENTIRE_SCREEN
-                )
-                if (clickedShareEntireScreen) {
-                    screenMirrorShareEntireScreenSelected = true
-                    Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] selected share entire screen")
-                    screenMirrorRetryHandler.postDelayed(
-                        screenMirrorRetryRunnable,
-                        SCREEN_MIRROR_RETRY_INTERVAL_MS
-                    )
-                    return
-                }
-            }
-
-            val clickedShareScreen = clickByExactText(
-                roots = roots,
-                targetText = SCREEN_MIRROR_TEXT_SHARE_SCREEN
-            )
-            if (clickedShareScreen) {
-                Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked share screen")
-                ScreenMirrorAutomationState.endPermissionFlow()
-                stopScreenMirrorAutomation()
+            if (manufacturer == SCREEN_MIRROR_MANUFACTURER_MOTOROLA &&
+                !isMotorolaPermissionContextVisible(roots)
+            ) {
+                scheduleScreenMirrorRetry()
                 return
             }
 
-            val clickedNext = clickByExactText(
-                roots = roots,
-                targetText = SCREEN_MIRROR_TEXT_NEXT
-            )
-            if (clickedNext) {
-                ScreenMirrorAutomationState.endPermissionFlow()
-                stopScreenMirrorAutomation()
-                return
+            when (screenMirrorPermissionStep) {
+                ScreenMirrorPermissionStep.STEP_OPEN_DROPDOWN -> {
+                    val clickedDropdown = clickByExactTexts(
+                        roots = roots,
+                        targetTexts = dropdownTextsForManufacturer(manufacturer)
+                    )
+                    if (clickedDropdown) {
+                        screenMirrorPermissionStep = ScreenMirrorPermissionStep.STEP_SELECT_ENTIRE_SCREEN
+                        Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked dropdown")
+                    }
+                }
+
+                ScreenMirrorPermissionStep.STEP_SELECT_ENTIRE_SCREEN -> {
+                    val selectedEntireScreen = if (manufacturer == SCREEN_MIRROR_MANUFACTURER_MOTOROLA) {
+                        handleMotorolaEntireScreenSelectionStep(roots)
+                    } else {
+                        clickByExactTexts(
+                            roots = roots,
+                            targetTexts = entireScreenTextsForManufacturer(manufacturer)
+                        )
+                    }
+                    if (selectedEntireScreen) {
+                        screenMirrorPermissionStep = ScreenMirrorPermissionStep.STEP_CONFIRM
+                        if (manufacturer == SCREEN_MIRROR_MANUFACTURER_MOTOROLA) {
+                            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] entire screen selection confirmed")
+                            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] moving to confirm")
+                        } else {
+                            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] selected entire screen")
+                            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] moved to confirm step")
+                        }
+                    }
+                }
+
+                ScreenMirrorPermissionStep.STEP_CONFIRM -> {
+                    val clickedConfirm = clickConfirmForManufacturer(
+                        roots = roots,
+                        manufacturer = manufacturer
+                    )
+                    if (clickedConfirm) {
+                        Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked confirm")
+                        ScreenMirrorAutomationState.endPermissionFlow()
+                        stopScreenMirrorAutomation()
+                        return
+                    }
+                }
             }
         } finally {
             roots.forEach { it.recycle() }
         }
 
+        scheduleScreenMirrorRetry()
+    }
+
+    private fun scheduleScreenMirrorRetry() {
         screenMirrorRetryHandler.postDelayed(screenMirrorRetryRunnable, SCREEN_MIRROR_RETRY_INTERVAL_MS)
+    }
+
+    private fun resolveScreenMirrorManufacturer(): String? {
+        val manufacturer = Build.MANUFACTURER?.trim()?.lowercase(Locale.US).orEmpty()
+        return when (manufacturer) {
+            SCREEN_MIRROR_MANUFACTURER_SAMSUNG -> SCREEN_MIRROR_MANUFACTURER_SAMSUNG
+            SCREEN_MIRROR_MANUFACTURER_MOTOROLA -> SCREEN_MIRROR_MANUFACTURER_MOTOROLA
+            else -> null
+        }
+    }
+
+    private fun isAllowedScreenMirrorPackage(packageName: String?): Boolean {
+        val normalized = packageName?.trim().orEmpty()
+        return normalized == SCREEN_MIRROR_SYSTEMUI_PACKAGE ||
+            normalized == SCREEN_MIRROR_PERMISSION_CONTROLLER_PACKAGE
+    }
+
+    private fun dropdownTextsForManufacturer(manufacturer: String): List<String> {
+        return when (manufacturer) {
+            SCREEN_MIRROR_MANUFACTURER_SAMSUNG -> listOf(SAMSUNG_TEXT_SHARE_ONE_APP)
+            SCREEN_MIRROR_MANUFACTURER_MOTOROLA -> listOf(MOTOROLA_TEXT_SINGLE_APP)
+            else -> emptyList()
+        }
+    }
+
+    private fun entireScreenTextsForManufacturer(manufacturer: String): List<String> {
+        return when (manufacturer) {
+            SCREEN_MIRROR_MANUFACTURER_SAMSUNG -> listOf(SAMSUNG_TEXT_SHARE_ENTIRE_SCREEN)
+            SCREEN_MIRROR_MANUFACTURER_MOTOROLA -> listOf(
+                MOTOROLA_TEXT_ENTIRE_SCREEN,
+                MOTOROLA_TEXT_FULL_SCREEN,
+                MOTOROLA_TEXT_WHOLE_SCREEN
+            )
+            else -> emptyList()
+        }
+    }
+
+    private fun clickConfirmForManufacturer(
+        roots: List<AccessibilityNodeInfo>,
+        manufacturer: String
+    ): Boolean {
+        return when (manufacturer) {
+            SCREEN_MIRROR_MANUFACTURER_SAMSUNG -> {
+                val shareScreenClicked = clickByExactText(roots, SAMSUNG_TEXT_SHARE_SCREEN)
+                if (shareScreenClicked) {
+                    true
+                } else {
+                    clickByExactText(roots, SAMSUNG_TEXT_NEXT)
+                }
+            }
+
+            SCREEN_MIRROR_MANUFACTURER_MOTOROLA -> {
+                clickByExactText(roots, MOTOROLA_TEXT_START)
+            }
+
+            else -> false
+        }
+    }
+
+    private fun hasMotorolaDialog(roots: List<AccessibilityNodeInfo>): Boolean {
+        return hasExactTextInTree(
+            roots = roots,
+            targetTexts = listOf(MOTOROLA_DIALOG_TITLE)
+        )
+    }
+
+    private fun isMotorolaPermissionContextVisible(roots: List<AccessibilityNodeInfo>): Boolean {
+        if (hasMotorolaDialog(roots)) {
+            return true
+        }
+        if (isMotorolaEntireScreenMenuVisible(roots)) {
+            return true
+        }
+        return hasExactTextInTree(
+            roots = roots,
+            targetTexts = listOf(MOTOROLA_TEXT_START)
+        )
+    }
+
+    private fun handleMotorolaEntireScreenSelectionStep(
+        roots: List<AccessibilityNodeInfo>
+    ): Boolean {
+        val entireScreenVisible = isMotorolaEntireScreenMenuVisible(roots)
+
+        if (!entireScreenVisible) {
+            return motorolaEntireScreenClickCount > 0
+        }
+
+        if (motorolaEntireScreenClickCount == 0) {
+            val firstClickApplied = clickMotorolaEntireScreenOption(roots)
+            if (firstClickApplied) {
+                motorolaEntireScreenClickCount = 1
+                Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] motorola first entire screen click")
+            }
+            return false
+        }
+
+        if (motorolaEntireScreenClickCount == 1) {
+            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] entire screen still visible")
+            val secondClickApplied = clickMotorolaEntireScreenOption(roots)
+            if (secondClickApplied) {
+                motorolaEntireScreenClickCount = 2
+                Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] motorola second entire screen click")
+            }
+            return false
+        }
+
+        return false
+    }
+
+    private fun isMotorolaEntireScreenMenuVisible(roots: List<AccessibilityNodeInfo>): Boolean {
+        val hasSingleAppOption = hasExactTextInTree(
+            roots = roots,
+            targetTexts = listOf(MOTOROLA_TEXT_SINGLE_APP)
+        )
+        val hasEntireScreenOption = hasExactTextInTree(
+            roots = roots,
+            targetTexts = listOf(MOTOROLA_TEXT_ENTIRE_SCREEN)
+        )
+        return hasSingleAppOption && hasEntireScreenOption
+    }
+
+    private fun clickMotorolaEntireScreenOption(roots: List<AccessibilityNodeInfo>): Boolean {
+        if (roots.isEmpty()) {
+            return false
+        }
+        val targets = setOf(normalizeText(MOTOROLA_TEXT_ENTIRE_SCREEN))
+        val menuCandidates = mutableListOf<AccessibilityNodeInfo>()
+        val fallbackCandidates = mutableListOf<AccessibilityNodeInfo>()
+
+        for (root in roots) {
+            collectMotorolaEntireScreenCandidatesInTree(
+                root = root,
+                normalizedTargets = targets,
+                menuCandidates = menuCandidates,
+                fallbackCandidates = fallbackCandidates
+            )
+        }
+
+        val orderedCandidates = mutableListOf<AccessibilityNodeInfo>()
+        orderedCandidates.addAll(menuCandidates)
+        orderedCandidates.addAll(fallbackCandidates)
+
+        for (candidate in orderedCandidates) {
+            try {
+                if (clickMotorolaEntireScreenCandidate(candidate)) {
+                    return true
+                }
+            } finally {
+                candidate.recycle()
+            }
+        }
+
+        return false
+    }
+
+    private fun collectMotorolaEntireScreenCandidatesInTree(
+        root: AccessibilityNodeInfo,
+        normalizedTargets: Set<String>,
+        menuCandidates: MutableList<AccessibilityNodeInfo>,
+        fallbackCandidates: MutableList<AccessibilityNodeInfo>
+    ) {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        val visited = mutableListOf<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        var scannedNodes = 0
+        try {
+            while (queue.isNotEmpty() && scannedNodes < MAX_NODE_SCAN_PER_ROOT) {
+                val node = queue.removeFirst()
+                visited.add(node)
+                scannedNodes += 1
+
+                if (isAllowedScreenMirrorPackage(node.packageName?.toString()) &&
+                    nodeMatchesTarget(node, normalizedTargets)
+                ) {
+                    val copy = AccessibilityNodeInfo.obtain(node)
+                    if (isMotorolaEntireScreenMenuCandidate(node)) {
+                        menuCandidates.add(copy)
+                    } else {
+                        fallbackCandidates.add(copy)
+                    }
+                }
+
+                for (childIndex in 0 until node.childCount) {
+                    node.getChild(childIndex)?.let { child ->
+                        queue.add(child)
+                    }
+                }
+            }
+        } finally {
+            visited.forEach { it.recycle() }
+            while (queue.isNotEmpty()) {
+                queue.removeFirst().recycle()
+            }
+        }
+    }
+
+    private fun clickMotorolaEntireScreenCandidate(node: AccessibilityNodeInfo): Boolean {
+        Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] found entire screen node")
+
+        val clickedNode = performMotorolaSelectionAction(node)
+        if (clickedNode) {
+            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked entire screen node")
+            return true
+        }
+
+        val clickedParent = clickClickableParent(node)
+        if (clickedParent) {
+            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked entire screen parent")
+            return true
+        }
+
+        val bounds = resolveMotorolaEntireScreenGestureBounds(node)
+        val clickedByGesture = bounds?.let { performGestureTap(it) } == true
+        if (clickedByGesture) {
+            Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] clicked entire screen by gesture")
+            return true
+        }
+
+        Log.i(TAG, "[SCREEN_MIRROR_ACCESSIBILITY] entire screen click failed")
+        return false
+    }
+
+    private fun performMotorolaSelectionAction(node: AccessibilityNodeInfo): Boolean {
+        return try {
+            if (node.performAction(AccessibilityNodeInfo.ACTION_CLICK)) {
+                true
+            } else {
+                node.performAction(AccessibilityNodeInfo.ACTION_SELECT)
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "Failed Motorola selection action", error)
+            false
+        }
+    }
+
+    private fun isMotorolaEntireScreenMenuCandidate(node: AccessibilityNodeInfo): Boolean {
+        val singleAppTargets = setOf(normalizeText(MOTOROLA_TEXT_SINGLE_APP))
+        val entireScreenTargets = setOf(normalizeText(MOTOROLA_TEXT_ENTIRE_SCREEN))
+        var current: AccessibilityNodeInfo? = AccessibilityNodeInfo.obtain(node)
+        var depth = 0
+        try {
+            while (current != null && depth <= 6) {
+                val hasSingleApp = treeContainsTargetText(current, singleAppTargets)
+                val hasEntireScreen = treeContainsTargetText(current, entireScreenTargets)
+                if (hasSingleApp && hasEntireScreen) {
+                    return true
+                }
+
+                val parent = current.parent
+                current.recycle()
+                current = parent
+                depth += 1
+            }
+        } finally {
+            current?.recycle()
+        }
+        return false
+    }
+
+    private fun resolveMotorolaEntireScreenGestureBounds(node: AccessibilityNodeInfo): Rect? {
+        val nodeBounds = Rect().also { node.getBoundsInScreen(it) }
+        var bestBounds: Rect? = if (nodeBounds.width() > 1 && nodeBounds.height() > 1) {
+            Rect(nodeBounds)
+        } else {
+            null
+        }
+        var bestArea = bestBounds?.let { it.width() * it.height() } ?: -1
+
+        var current = node.parent
+        var depth = 0
+        while (current != null && depth <= 6) {
+            try {
+                if (isAllowedScreenMirrorPackage(current.packageName?.toString())) {
+                    val parentBounds = Rect().also { current.getBoundsInScreen(it) }
+                    val area = parentBounds.width() * parentBounds.height()
+                    if (parentBounds.width() > 1 && parentBounds.height() > 1 && area > bestArea) {
+                        bestBounds = Rect(parentBounds)
+                        bestArea = area
+                    }
+                }
+                val parent = current.parent
+                current.recycle()
+                current = parent
+                depth += 1
+            } catch (_: Throwable) {
+                current.recycle()
+                current = null
+            }
+        }
+
+        return bestBounds
+    }
+
+    private fun clickClickableParent(node: AccessibilityNodeInfo): Boolean {
+        var current = node.parent
+        var depth = 0
+        while (current != null && depth <= 10) {
+            if (current.isEnabled) {
+                return try {
+                    performMotorolaSelectionAction(current)
+                } catch (error: Throwable) {
+                    Log.w(TAG, "Failed to click Motorola entire screen parent", error)
+                    false
+                } finally {
+                    current.recycle()
+                }
+            }
+
+            val parent = current.parent
+            current.recycle()
+            current = parent
+            depth += 1
+        }
+        return false
+    }
+
+    private fun hasExactTextInTree(
+        roots: List<AccessibilityNodeInfo>,
+        targetTexts: List<String>
+    ): Boolean {
+        if (roots.isEmpty() || targetTexts.isEmpty()) {
+            return false
+        }
+        val normalizedTargets = targetTexts
+            .map { normalizeText(it) }
+            .filter { it.isNotBlank() }
+            .toSet()
+        if (normalizedTargets.isEmpty()) {
+            return false
+        }
+
+        for (root in roots) {
+            if (treeContainsTargetText(root, normalizedTargets)) {
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun treeContainsTargetText(
+        root: AccessibilityNodeInfo,
+        normalizedTargets: Set<String>
+    ): Boolean {
+        val queue = ArrayDeque<AccessibilityNodeInfo>()
+        val visited = mutableListOf<AccessibilityNodeInfo>()
+        queue.add(AccessibilityNodeInfo.obtain(root))
+        var scannedNodes = 0
+        try {
+            while (queue.isNotEmpty() && scannedNodes < MAX_NODE_SCAN_PER_ROOT) {
+                val node = queue.removeFirst()
+                visited.add(node)
+                scannedNodes += 1
+
+                if (isAllowedScreenMirrorPackage(node.packageName?.toString()) &&
+                    nodeMatchesTarget(node, normalizedTargets)
+                ) {
+                    return true
+                }
+
+                for (childIndex in 0 until node.childCount) {
+                    node.getChild(childIndex)?.let { child ->
+                        queue.add(child)
+                    }
+                }
+            }
+        } finally {
+            visited.forEach { it.recycle() }
+            while (queue.isNotEmpty()) {
+                queue.removeFirst().recycle()
+            }
+        }
+        return false
     }
 
     private fun clickByExactText(
@@ -359,7 +765,7 @@ class AutoCallAccessibilityService : AccessibilityService() {
     }
 
     private fun isSystemUiNode(node: AccessibilityNodeInfo): Boolean {
-        return node.packageName?.toString()?.trim() == SCREEN_MIRROR_SYSTEMUI_PACKAGE
+        return isAllowedScreenMirrorPackage(node.packageName?.toString())
     }
 
     private fun nodeMatchesTarget(
