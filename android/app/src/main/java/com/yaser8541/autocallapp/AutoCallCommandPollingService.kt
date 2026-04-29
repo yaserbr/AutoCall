@@ -33,6 +33,12 @@ class AutoCallCommandPollingService : Service() {
         private const val MAX_DOWNLOAD_SIZE_MB = 1000
         private const val DOWNLOAD_STREAM_CHUNK_BYTES = 64 * 1024
         private const val MAX_TRACKED_PROCESSED_COMMAND_IDS = 500
+        private const val SCREEN_TOUCH_FAILURE_REASON_ACCESSIBILITY_DISABLED =
+            "accessibility_service_not_enabled"
+        private const val SCREEN_TOUCH_FAILURE_REASON_ACCESSIBILITY_NOT_READY =
+            "accessibility_service_not_connected"
+        private const val SCREEN_TOUCH_MIN_DURATION_MS = 50
+        private const val SCREEN_TOUCH_MAX_DURATION_MS = 10000
         private const val DOWNLOAD_DATA_SUCCESS_EVENT_MESSAGE =
             "Download data command executed successfully"
 
@@ -69,6 +75,16 @@ class AutoCallCommandPollingService : Service() {
         val downloadSizeMb: Int?,
         val enabled: Boolean?,
         val autoHangupSeconds: Int?,
+        val x: Int?,
+        val y: Int?,
+        val screenWidth: Int?,
+        val screenHeight: Int?,
+        val startX: Int?,
+        val startY: Int?,
+        val endX: Int?,
+        val endY: Int?,
+        val durationMs: Int?,
+        val touchTarget: String?,
         val scheduledAt: String?
     )
 
@@ -325,6 +341,16 @@ class AutoCallCommandPollingService : Service() {
             downloadSizeMb = parseDownloadSizeMb(item),
             enabled = parseAutoAnswerEnabled(item),
             autoHangupSeconds = parseAutoHangupSeconds(item),
+            x = parseNonNegativeIntegerField(item, "x"),
+            y = parseNonNegativeIntegerField(item, "y"),
+            screenWidth = parsePositiveIntegerField(item, "screenWidth"),
+            screenHeight = parsePositiveIntegerField(item, "screenHeight"),
+            startX = parseNonNegativeIntegerField(item, "startX"),
+            startY = parseNonNegativeIntegerField(item, "startY"),
+            endX = parseNonNegativeIntegerField(item, "endX"),
+            endY = parseNonNegativeIntegerField(item, "endY"),
+            durationMs = parseDurationMsField(item, "durationMs"),
+            touchTarget = parseTouchTarget(item),
             scheduledAt = if (item.isNull("scheduledAt")) null else item.optString("scheduledAt")
         )
     }
@@ -396,6 +422,8 @@ class AutoCallCommandPollingService : Service() {
             "download_data" -> dispatchDownloadDataCommand(command)
             "start_screen_mirror" -> dispatchStartScreenMirrorCommand(command)
             "stop_screen_mirror" -> dispatchStopScreenMirrorCommand(command)
+            "screen_touch" -> dispatchScreenTouchCommand(command)
+            "screen_swipe" -> dispatchScreenSwipeCommand(command)
             else -> dispatchCallCommand(command)
         }
     }
@@ -414,7 +442,9 @@ class AutoCallCommandPollingService : Service() {
                 "return_to_autocall",
                 "download_data",
                 "start_screen_mirror",
-                "stop_screen_mirror" -> return explicitAction
+                "stop_screen_mirror",
+                "screen_touch",
+                "screen_swipe" -> return explicitAction
             }
         }
         return when {
@@ -428,6 +458,8 @@ class AutoCallCommandPollingService : Service() {
             command.type.equals("DOWNLOAD_DATA", ignoreCase = true) -> "download_data"
             command.type.equals("START_SCREEN_MIRROR", ignoreCase = true) -> "start_screen_mirror"
             command.type.equals("STOP_SCREEN_MIRROR", ignoreCase = true) -> "stop_screen_mirror"
+            command.type.equals("SCREEN_TOUCH", ignoreCase = true) -> "screen_touch"
+            command.type.equals("SCREEN_SWIPE", ignoreCase = true) -> "screen_swipe"
             else -> "call"
         }
     }
@@ -1122,6 +1154,160 @@ class AutoCallCommandPollingService : Service() {
         }
     }
 
+    private fun resolveAccessibilityTouchControlFailureReason(): String? {
+        val snapshot = AutoCallAccessibilityHelper.snapshot(applicationContext)
+        if (!snapshot.enabled) {
+            return SCREEN_TOUCH_FAILURE_REASON_ACCESSIBILITY_DISABLED
+        }
+        if (!snapshot.ready) {
+            return SCREEN_TOUCH_FAILURE_REASON_ACCESSIBILITY_NOT_READY
+        }
+        return null
+    }
+
+    private fun dispatchScreenTouchCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            val touchTarget = command.touchTarget?.trim()?.lowercase(Locale.US)
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=screen_touch " +
+                    "touchTarget=${touchTarget ?: "none"} x=${command.x ?: "null"} y=${command.y ?: "null"} " +
+                    "screenWidth=${command.screenWidth ?: "null"} screenHeight=${command.screenHeight ?: "null"}"
+            )
+
+            val accessibilityFailureReason = resolveAccessibilityTouchControlFailureReason()
+            if (accessibilityFailureReason != null) {
+                updateCommandStatus(command.id, "failed", accessibilityFailureReason)
+                Log.w(
+                    TAG,
+                    "background/runtime SCREEN_TOUCH blocked commandId=${command.id} reason=$accessibilityFailureReason"
+                )
+                return false
+            }
+
+            val result = if (!touchTarget.isNullOrBlank()) {
+                AutoCallAccessibilityService.performRemoteGlobalAction(touchTarget)
+            } else {
+                val x = command.x
+                val y = command.y
+                if (x == null || y == null) {
+                    updateCommandStatus(command.id, "failed", "screen_touch_missing_coordinates")
+                    Log.w(
+                        TAG,
+                        "background/runtime SCREEN_TOUCH missing coordinates commandId=${command.id}"
+                    )
+                    return false
+                }
+                AutoCallAccessibilityService.performRemoteTap(x, y)
+            }
+
+            if (!result.success) {
+                val failureReason =
+                    result.failureReason ?: "screen_touch_execution_failed"
+                updateCommandStatus(command.id, "failed", failureReason)
+                Log.w(
+                    TAG,
+                    "background/runtime SCREEN_TOUCH failed commandId=${command.id} " +
+                        "failureReason=$failureReason message=${result.message}"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            Log.i(
+                TAG,
+                "background/runtime SCREEN_TOUCH executed commandId=${command.id} " +
+                    "touchTarget=${touchTarget ?: "none"}"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(TAG, "background/runtime SCREEN_TOUCH command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", error.message ?: "screen_touch_command_crash")
+            return false
+        } finally {
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=screen_touch"
+            )
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
+    private fun dispatchScreenSwipeCommand(command: ServerCallCommand): Boolean {
+        inFlightCommandIds.add(command.id)
+        try {
+            Log.i(
+                TAG,
+                "background/runtime command execution started commandId=${command.id} action=screen_swipe " +
+                    "start=(${command.startX ?: "null"},${command.startY ?: "null"}) " +
+                    "end=(${command.endX ?: "null"},${command.endY ?: "null"}) durationMs=${command.durationMs ?: "null"}"
+            )
+
+            val accessibilityFailureReason = resolveAccessibilityTouchControlFailureReason()
+            if (accessibilityFailureReason != null) {
+                updateCommandStatus(command.id, "failed", accessibilityFailureReason)
+                Log.w(
+                    TAG,
+                    "background/runtime SCREEN_SWIPE blocked commandId=${command.id} reason=$accessibilityFailureReason"
+                )
+                return false
+            }
+
+            val startX = command.startX
+            val startY = command.startY
+            val endX = command.endX
+            val endY = command.endY
+            if (startX == null || startY == null || endX == null || endY == null) {
+                updateCommandStatus(command.id, "failed", "screen_swipe_missing_coordinates")
+                Log.w(
+                    TAG,
+                    "background/runtime SCREEN_SWIPE missing coordinates commandId=${command.id}"
+                )
+                return false
+            }
+
+            val durationMs = (command.durationMs ?: SCREEN_TOUCH_MIN_DURATION_MS)
+                .coerceIn(SCREEN_TOUCH_MIN_DURATION_MS, SCREEN_TOUCH_MAX_DURATION_MS)
+            val result = AutoCallAccessibilityService.performRemoteSwipe(
+                startX = startX,
+                startY = startY,
+                endX = endX,
+                endY = endY,
+                durationMs = durationMs
+            )
+
+            if (!result.success) {
+                val failureReason =
+                    result.failureReason ?: "screen_swipe_execution_failed"
+                updateCommandStatus(command.id, "failed", failureReason)
+                Log.w(
+                    TAG,
+                    "background/runtime SCREEN_SWIPE failed commandId=${command.id} " +
+                        "failureReason=$failureReason message=${result.message}"
+                )
+                return false
+            }
+
+            updateCommandStatus(command.id, "executed")
+            Log.i(
+                TAG,
+                "background/runtime SCREEN_SWIPE executed commandId=${command.id} durationMs=$durationMs"
+            )
+            return true
+        } catch (error: Throwable) {
+            Log.e(TAG, "background/runtime SCREEN_SWIPE command crash commandId=${command.id}", error)
+            updateCommandStatus(command.id, "failed", error.message ?: "screen_swipe_command_crash")
+            return false
+        } finally {
+            Log.i(
+                TAG,
+                "background/runtime command execution finished commandId=${command.id} action=screen_swipe"
+            )
+            inFlightCommandIds.remove(command.id)
+        }
+    }
+
     private fun updateCommandStatus(
         commandId: String,
         status: String,
@@ -1159,6 +1345,49 @@ class AutoCallCommandPollingService : Service() {
             return
         }
         Log.i(TAG, "background/runtime status update success commandId=$commandId status=$status")
+    }
+
+    private fun parseNonNegativeIntegerField(item: JSONObject, key: String): Int? {
+        if (!item.has(key) || item.isNull(key)) {
+            return null
+        }
+        val raw = item.optDouble(key, Double.NaN)
+        if (raw.isNaN()) {
+            return null
+        }
+        if (raw % 1.0 != 0.0) {
+            return null
+        }
+        val normalized = raw.toInt()
+        if (normalized < 0) {
+            return null
+        }
+        return normalized
+    }
+
+    private fun parsePositiveIntegerField(item: JSONObject, key: String): Int? {
+        val parsed = parseNonNegativeIntegerField(item, key) ?: return null
+        return parsed.takeIf { value -> value > 0 }
+    }
+
+    private fun parseDurationMsField(item: JSONObject, key: String): Int? {
+        val parsed = parsePositiveIntegerField(item, key) ?: return null
+        return parsed.coerceIn(SCREEN_TOUCH_MIN_DURATION_MS, SCREEN_TOUCH_MAX_DURATION_MS)
+    }
+
+    private fun parseTouchTarget(item: JSONObject): String? {
+        if (!item.has("touchTarget") || item.isNull("touchTarget")) {
+            return null
+        }
+        val normalized = item.optString("touchTarget", "").trim().lowercase(Locale.US)
+        if (normalized.isBlank()) {
+            return null
+        }
+        return if (normalized == "back" || normalized == "home" || normalized == "recents") {
+            normalized
+        } else {
+            null
+        }
     }
 
     private fun parseDurationSeconds(item: JSONObject): Int? {

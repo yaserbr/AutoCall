@@ -26,6 +26,9 @@ class AutoCallAccessibilityService : AccessibilityService() {
         private const val VERIFY_WINDOW_MS = 1300L
         private const val GESTURE_DURATION_MS = 40L
         private const val GESTURE_WAIT_MS = 700L
+        private const val REMOTE_TAP_DURATION_MS = 50L
+        private const val REMOTE_GESTURE_MIN_DURATION_MS = 50L
+        private const val REMOTE_GESTURE_MAX_DURATION_MS = 10000L
         private const val MAX_NODE_SCAN_PER_ROOT = 650
         private const val SCREEN_MIRROR_SYSTEMUI_PACKAGE = "com.android.systemui"
         private const val SCREEN_MIRROR_PERMISSION_CONTROLLER_PACKAGE =
@@ -77,6 +80,12 @@ class AutoCallAccessibilityService : AccessibilityService() {
             val mainActivityWindowFocusedAfterClick: Boolean
         )
 
+        data class RemoteControlExecutionResult(
+            val success: Boolean,
+            val failureReason: String?,
+            val message: String
+        )
+
         fun isServiceConnected(): Boolean {
             return connectedFlag && connectedService != null
         }
@@ -108,6 +117,57 @@ class AutoCallAccessibilityService : AccessibilityService() {
                 targetAppLabel = targetAppLabel,
                 timeoutMs = timeoutMs
             )
+        }
+
+        fun performRemoteTap(x: Int, y: Int): RemoteControlExecutionResult {
+            val service = connectedService
+            if (service == null) {
+                return RemoteControlExecutionResult(
+                    success = false,
+                    failureReason = "accessibility_service_not_connected",
+                    message = "Accessibility service is not connected"
+                )
+            }
+
+            return service.executeRemoteTap(x, y)
+        }
+
+        fun performRemoteSwipe(
+            startX: Int,
+            startY: Int,
+            endX: Int,
+            endY: Int,
+            durationMs: Int
+        ): RemoteControlExecutionResult {
+            val service = connectedService
+            if (service == null) {
+                return RemoteControlExecutionResult(
+                    success = false,
+                    failureReason = "accessibility_service_not_connected",
+                    message = "Accessibility service is not connected"
+                )
+            }
+
+            return service.executeRemoteSwipe(
+                startX = startX,
+                startY = startY,
+                endX = endX,
+                endY = endY,
+                durationMs = durationMs
+            )
+        }
+
+        fun performRemoteGlobalAction(target: String): RemoteControlExecutionResult {
+            val service = connectedService
+            if (service == null) {
+                return RemoteControlExecutionResult(
+                    success = false,
+                    failureReason = "accessibility_service_not_connected",
+                    message = "Accessibility service is not connected"
+                )
+            }
+
+            return service.executeRemoteGlobalAction(target)
         }
     }
 
@@ -1178,6 +1238,152 @@ class AutoCallAccessibilityService : AccessibilityService() {
         return best
     }
 
+    private fun executeRemoteTap(x: Int, y: Int): RemoteControlExecutionResult {
+        val path = Path().apply {
+            moveTo(x.toFloat(), y.toFloat())
+        }
+        val dispatched = dispatchGesturePath(path, REMOTE_TAP_DURATION_MS)
+        return if (dispatched) {
+            RemoteControlExecutionResult(
+                success = true,
+                failureReason = null,
+                message = "tap_dispatched"
+            )
+        } else {
+            RemoteControlExecutionResult(
+                success = false,
+                failureReason = "gesture_dispatch_failed",
+                message = "Failed to dispatch tap gesture"
+            )
+        }
+    }
+
+    private fun executeRemoteSwipe(
+        startX: Int,
+        startY: Int,
+        endX: Int,
+        endY: Int,
+        durationMs: Int
+    ): RemoteControlExecutionResult {
+        val safeDurationMs = durationMs.toLong()
+            .coerceAtLeast(REMOTE_GESTURE_MIN_DURATION_MS)
+            .coerceAtMost(REMOTE_GESTURE_MAX_DURATION_MS)
+        val path = Path().apply {
+            moveTo(startX.toFloat(), startY.toFloat())
+            lineTo(endX.toFloat(), endY.toFloat())
+        }
+        val dispatched = dispatchGesturePath(path, safeDurationMs)
+        return if (dispatched) {
+            RemoteControlExecutionResult(
+                success = true,
+                failureReason = null,
+                message = "swipe_dispatched"
+            )
+        } else {
+            RemoteControlExecutionResult(
+                success = false,
+                failureReason = "gesture_dispatch_failed",
+                message = "Failed to dispatch swipe gesture"
+            )
+        }
+    }
+
+    private fun executeRemoteGlobalAction(target: String): RemoteControlExecutionResult {
+        val normalizedTarget = target.trim().lowercase(Locale.US)
+        val globalAction = when (normalizedTarget) {
+            "back" -> GLOBAL_ACTION_BACK
+            "home" -> GLOBAL_ACTION_HOME
+            "recents" -> GLOBAL_ACTION_RECENTS
+            else -> null
+        }
+        if (globalAction == null) {
+            return RemoteControlExecutionResult(
+                success = false,
+                failureReason = "unsupported_touch_target",
+                message = "Unsupported touch target: $target"
+            )
+        }
+
+        val success = try {
+            performGlobalAction(globalAction)
+        } catch (error: Throwable) {
+            Log.e(TAG, "performGlobalAction failed for target=$normalizedTarget", error)
+            false
+        }
+
+        return if (success) {
+            RemoteControlExecutionResult(
+                success = true,
+                failureReason = null,
+                message = "global_action_dispatched:$normalizedTarget"
+            )
+        } else {
+            RemoteControlExecutionResult(
+                success = false,
+                failureReason = "global_action_failed",
+                message = "Failed to perform global action: $normalizedTarget"
+            )
+        }
+    }
+
+    private fun dispatchGesturePath(path: Path, durationMs: Long): Boolean {
+        val safeDurationMs = durationMs.coerceAtLeast(1L)
+        val stroke = GestureDescription.StrokeDescription(path, 0, safeDurationMs)
+        val gesture = GestureDescription.Builder().addStroke(stroke).build()
+
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            return try {
+                dispatchGesture(gesture, null, null)
+            } catch (error: Throwable) {
+                Log.e(TAG, "gesture dispatch failed", error)
+                false
+            }
+        }
+
+        val callbackCompleted = AtomicBoolean(false)
+        val dispatchRequested = AtomicBoolean(false)
+        val latch = CountDownLatch(1)
+
+        val dispatchRunnable = Runnable {
+            val dispatched = try {
+                dispatchGesture(
+                    gesture,
+                    object : GestureResultCallback() {
+                        override fun onCompleted(gestureDescription: GestureDescription?) {
+                            callbackCompleted.set(true)
+                            latch.countDown()
+                        }
+
+                        override fun onCancelled(gestureDescription: GestureDescription?) {
+                            callbackCompleted.set(false)
+                            latch.countDown()
+                        }
+                    },
+                    null
+                )
+            } catch (error: Throwable) {
+                Log.e(TAG, "gesture dispatch failed", error)
+                false
+            }
+
+            dispatchRequested.set(dispatched)
+            if (!dispatched) {
+                latch.countDown()
+            }
+        }
+
+        screenMirrorRetryHandler.post(dispatchRunnable)
+
+        val waitTimeoutMs = safeDurationMs + GESTURE_WAIT_MS + 1000L
+        return try {
+            latch.await(waitTimeoutMs, TimeUnit.MILLISECONDS)
+            dispatchRequested.get() && callbackCompleted.get()
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
     private fun performGestureTap(bounds: Rect): Boolean {
         if (bounds.width() <= 1 || bounds.height() <= 1) {
             return false
@@ -1186,43 +1392,7 @@ class AutoCallAccessibilityService : AccessibilityService() {
         val centerX = (bounds.left + bounds.right) / 2f
         val centerY = (bounds.top + bounds.bottom) / 2f
         val path = Path().apply { moveTo(centerX, centerY) }
-        val stroke = GestureDescription.StrokeDescription(path, 0, GESTURE_DURATION_MS)
-        val gesture = GestureDescription.Builder().addStroke(stroke).build()
-
-        val completed = AtomicBoolean(false)
-        val latch = CountDownLatch(1)
-        val dispatched = try {
-            dispatchGesture(
-                gesture,
-                object : GestureResultCallback() {
-                    override fun onCompleted(gestureDescription: GestureDescription?) {
-                        completed.set(true)
-                        latch.countDown()
-                    }
-
-                    override fun onCancelled(gestureDescription: GestureDescription?) {
-                        completed.set(false)
-                        latch.countDown()
-                    }
-                },
-                null
-            )
-        } catch (error: Throwable) {
-            Log.e(TAG, "gesture dispatch failed", error)
-            false
-        }
-
-        if (!dispatched) {
-            return false
-        }
-
-        return try {
-            latch.await(GESTURE_WAIT_MS, TimeUnit.MILLISECONDS)
-            completed.get()
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
+        return dispatchGesturePath(path, GESTURE_DURATION_MS)
     }
 
     private fun verifyForegroundStrict(
