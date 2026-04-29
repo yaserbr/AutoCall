@@ -209,8 +209,12 @@ class AutoCallCommandPollingService : Service() {
         }
 
         val deviceUid = currentDeviceUid()
+        val deviceToken = currentDeviceToken()
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            if (deviceToken.isNotBlank()) {
+                put("deviceToken", deviceToken)
+            }
         }
         val result = postJson("$SERVER/devices/register", payload)
         if (result.isSuccessCode()) {
@@ -227,8 +231,12 @@ class AutoCallCommandPollingService : Service() {
 
     private fun sendHeartbeat() {
         val deviceUid = currentDeviceUid()
+        val deviceToken = currentDeviceToken()
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            if (deviceToken.isNotBlank()) {
+                put("deviceToken", deviceToken)
+            }
         }
         val result = postJson("$SERVER/devices/heartbeat", payload)
         if (result.isSuccessCode()) {
@@ -240,8 +248,12 @@ class AutoCallCommandPollingService : Service() {
 
     private fun claimNextCommand(): ServerCallCommand? {
         val deviceUid = currentDeviceUid()
+        val deviceToken = currentDeviceToken()
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            if (deviceToken.isNotBlank()) {
+                put("deviceToken", deviceToken)
+            }
         }
         Log.i(TAG, "background/runtime command claim request uid=$deviceUid")
         val result = postJson("$SERVER/commands/claim", payload)
@@ -1116,7 +1128,13 @@ class AutoCallCommandPollingService : Service() {
         failureReason: String? = null,
         downloadDurationSeconds: Int? = null
     ) {
+        val deviceUid = currentDeviceUid()
+        val deviceToken = currentDeviceToken()
         val payload = JSONObject().apply {
+            put("deviceUid", deviceUid)
+            if (deviceToken.isNotBlank()) {
+                put("deviceToken", deviceToken)
+            }
             put("status", status)
             if (!failureReason.isNullOrBlank()) {
                 put("failureReason", failureReason)
@@ -1252,6 +1270,10 @@ class AutoCallCommandPollingService : Service() {
         return DeviceIdentityStore.getOrCreateDeviceUid(applicationContext)
     }
 
+    private fun currentDeviceToken(): String {
+        return DeviceIdentityStore.getDeviceToken(applicationContext)
+    }
+
     private fun syncDeviceIdentityFromServerResponse(rawBody: String) {
         if (rawBody.isBlank()) {
             return
@@ -1262,10 +1284,12 @@ class AutoCallCommandPollingService : Service() {
             val device = root.optJSONObject("device") ?: return
             val serverDeviceUid = if (device.isNull("deviceUid")) null else device.optString("deviceUid")
             val serverDeviceName = if (device.isNull("deviceName")) null else device.optString("deviceName")
+            val serverDeviceToken = if (root.isNull("deviceToken")) null else root.optString("deviceToken")
             DeviceIdentityStore.syncFromServer(
                 context = applicationContext,
                 deviceUid = serverDeviceUid,
-                deviceName = serverDeviceName
+                deviceName = serverDeviceName,
+                deviceToken = serverDeviceToken
             )
         } catch (error: Throwable) {
             Log.w(TAG, "background/runtime identity sync parse failed", error)
@@ -1277,12 +1301,17 @@ class AutoCallCommandPollingService : Service() {
         try {
             val startNanos = System.nanoTime()
             val targetUrl = "$SERVER/dummy-download?mb=$downloadSizeMb"
+            val snapshot = DeviceIdentityStore.snapshot(applicationContext)
             connection = URL(targetUrl).openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
             connection.connectTimeout = 15_000
             connection.readTimeout = 120_000
             connection.useCaches = false
             connection.setRequestProperty("Accept", "application/octet-stream")
+            connection.setRequestProperty("X-Device-Uid", snapshot.deviceUid)
+            if (snapshot.deviceToken.isNotBlank()) {
+                connection.setRequestProperty("X-Device-Token", snapshot.deviceToken)
+            }
 
             val responseCode = connection.responseCode
             if (responseCode !in 200..299) {
@@ -1322,6 +1351,15 @@ class AutoCallCommandPollingService : Service() {
             connection.useCaches = false
             connection.doOutput = true
             connection.setRequestProperty("Content-Type", "application/json")
+
+            val payloadDeviceUid = payload.optString("deviceUid", "").trim().lowercase(Locale.US)
+            if (payloadDeviceUid.isNotEmpty()) {
+                connection.setRequestProperty("X-Device-Uid", payloadDeviceUid)
+            }
+            val payloadDeviceToken = payload.optString("deviceToken", "").trim().lowercase(Locale.US)
+            if (payloadDeviceToken.isNotEmpty()) {
+                connection.setRequestProperty("X-Device-Token", payloadDeviceToken)
+            }
 
             val bytes = payload.toString().toByteArray(StandardCharsets.UTF_8)
             connection.outputStream.use { output ->

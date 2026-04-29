@@ -7,13 +7,15 @@ import java.util.Locale
 
 data class DeviceIdentitySnapshot(
     val deviceUid: String,
-    val deviceName: String
+    val deviceName: String,
+    val deviceToken: String
 )
 
 object DeviceIdentityStore {
     private const val PREFS_NAME = "autocall_device_identity_prefs"
     private const val KEY_DEVICE_UID = "device_uid"
     private const val KEY_DEVICE_NAME = "device_name"
+    private const val KEY_DEVICE_TOKEN = "device_token"
     private const val DEVICE_NAME_MAX_LENGTH = 60
     private const val DEVICE_UID_LENGTH = 5
     private const val DEVICE_NAME_PREFIX = "Device"
@@ -21,6 +23,7 @@ object DeviceIdentityStore {
 
     private const val UID_RANDOM_CHARSET = "abcdefghijklmnopqrstuvwxyz0123456789"
     private val DEVICE_UID_REGEX = Regex("^[a-z0-9]{$DEVICE_UID_LENGTH}$")
+    private val DEVICE_TOKEN_REGEX = Regex("^[a-f0-9]{64}$")
 
     fun getOrCreateDeviceUid(context: Context): String {
         val appContext = context.applicationContext
@@ -62,7 +65,12 @@ object DeviceIdentityStore {
         prefs(appContext).edit().putString(KEY_DEVICE_NAME, normalized).apply()
     }
 
-    fun syncFromServer(context: Context, deviceUid: String?, deviceName: String?) {
+    fun getDeviceToken(context: Context): String {
+        val appContext = context.applicationContext
+        return normalizeDeviceToken(prefs(appContext).getString(KEY_DEVICE_TOKEN, null))
+    }
+
+    fun syncFromServer(context: Context, deviceUid: String?, deviceName: String?, deviceToken: String?) {
         val appContext = context.applicationContext
         val normalizedServerUid = normalizeUid(deviceUid)
         if (normalizedServerUid.isEmpty()) {
@@ -74,8 +82,20 @@ object DeviceIdentityStore {
             return
         }
 
-        val normalizedServerName = normalizeDeviceName(deviceName) ?: return
-        prefs(appContext).edit().putString(KEY_DEVICE_NAME, normalizedServerName).apply()
+        val normalizedServerName = normalizeDeviceName(deviceName)
+        val normalizedServerToken = normalizeDeviceToken(deviceToken)
+        if (normalizedServerName == null && normalizedServerToken.isEmpty()) {
+            return
+        }
+
+        val edit = prefs(appContext).edit()
+        if (normalizedServerName != null) {
+            edit.putString(KEY_DEVICE_NAME, normalizedServerName)
+        }
+        if (normalizedServerToken.isNotEmpty()) {
+            edit.putString(KEY_DEVICE_TOKEN, normalizedServerToken)
+        }
+        edit.apply()
     }
 
     fun snapshot(context: Context): DeviceIdentitySnapshot {
@@ -84,7 +104,8 @@ object DeviceIdentityStore {
         val name = getDeviceName(appContext)
         return DeviceIdentitySnapshot(
             deviceUid = uid,
-            deviceName = name
+            deviceName = name,
+            deviceToken = getDeviceToken(appContext)
         )
     }
 
@@ -134,6 +155,7 @@ object DeviceIdentityStore {
             prefs.edit()
                 .remove(KEY_DEVICE_UID)
                 .remove(KEY_DEVICE_NAME)
+                .remove(KEY_DEVICE_TOKEN)
                 .apply()
         }
         return ""
@@ -145,6 +167,11 @@ object DeviceIdentityStore {
             return null
         }
         return trimmed.take(DEVICE_NAME_MAX_LENGTH)
+    }
+
+    private fun normalizeDeviceToken(value: String?): String {
+        val trimmed = value?.trim().orEmpty().lowercase(Locale.US)
+        return if (DEVICE_TOKEN_REGEX.matches(trimmed)) trimmed else ""
     }
 
     private fun prefs(context: Context) =

@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from "react";
 import {
   AppState,
+  Image,
+  ImageBackground,
   PermissionsAndroid,
   Platform,
   Pressable,
@@ -11,24 +13,25 @@ import {
   View,
 } from "react-native";
 import {
+  closeInAppWebView,
+  disableAutoAnswer,
+  downloadDataForCommand,
+  enableAutoAnswer,
+  endCurrentCall,
+  getDeviceIdentity,
+  getInAppWebViewState,
+  getStatus,
+  openInAppWebView,
+  openInstalledApp,
+  returnToAutoCall,
+  startServerCommandCall,
+  startServerCommandSms,
+  startSimpleCall,
+  syncDeviceIdentity,
+  takePendingScreenMirrorStartCommandId,
   type AutoAnswerStatus,
   type DeviceIdentity,
   type InAppWebViewState,
-  closeInAppWebView,
-  disableAutoAnswer,
-  getDeviceIdentity,
-  getInAppWebViewState,
-  enableAutoAnswer,
-  endCurrentCall,
-  getStatus,
-  downloadDataForCommand,
-  openInstalledApp,
-  openInAppWebView,
-  returnToAutoCall,
-  startSimpleCall,
-  startServerCommandCall,
-  startServerCommandSms,
-  takePendingScreenMirrorStartCommandId,
 } from "../src/native/autoCallNative";
 import {
   getScreenMirrorState,
@@ -51,6 +54,7 @@ const MAX_TRACKED_PROCESSED_COMMAND_IDS = 500;
 const LOG_PREFIX = "[AutoCall/UI]";
 const SMS_PERMISSION_DENIED_REASON = "SEND_SMS permission denied";
 const DEVICE_UID_REGEX = /^[a-z0-9]{5}$/;
+const DEVICE_TOKEN_REGEX = /^[a-f0-9]{64}$/;
 const DOWNLOAD_DATA_SUCCESS_MESSAGE = "Download data command executed successfully";
 const DOWNLOAD_DATA_BANNER_DURATION_MS = 10_000;
 
@@ -99,6 +103,12 @@ type ServerCallCommand = {
 type ServerDevice = {
   deviceUid?: string;
   deviceName?: string | null;
+};
+
+type ServerDeviceResponse = {
+  success?: boolean;
+  device?: ServerDevice | null;
+  deviceToken?: string | null;
 };
 
 type ClaimNextCommandResponse = {
@@ -165,6 +175,14 @@ const normalizeDeviceUid = (value: string | null | undefined): string => {
   return DEVICE_UID_REGEX.test(normalized) ? normalized : "";
 };
 
+const normalizeDeviceToken = (value: string | null | undefined): string => {
+  if (typeof value !== "string") {
+    return "";
+  }
+  const normalized = value.trim().toLowerCase();
+  return DEVICE_TOKEN_REGEX.test(normalized) ? normalized : "";
+};
+
 const normalizeCallPhoneNumber = (input: string): string | null => {
   const trimmed = input.trim();
   if (!trimmed) return null;
@@ -222,6 +240,7 @@ const formatTime = (timestamp: number): string => {
 const emptyDeviceIdentity: DeviceIdentity = {
   deviceUid: "",
   deviceName: "",
+  deviceToken: "",
 };
 
 export default function AutoCallScreen() {
@@ -246,6 +265,7 @@ export default function AutoCallScreen() {
   const screenMirrorPendingCommandProcessingRef = useRef(false);
   const deviceUidRef = useRef<string>("");
   const deviceNameRef = useRef<string>("");
+  const deviceTokenRef = useRef<string>("");
 
   const updateUiFromStatus = (status: AutoAnswerStatus) => {
     setUiState({
@@ -261,12 +281,15 @@ export default function AutoCallScreen() {
   const applyDeviceIdentity = (identity: DeviceIdentity) => {
     const normalizedUid = normalizeDeviceUid(identity.deviceUid);
     const normalizedName = typeof identity.deviceName === "string" ? identity.deviceName.trim() : "";
+    const normalizedToken = normalizeDeviceToken(identity.deviceToken);
 
     deviceUidRef.current = normalizedUid;
     deviceNameRef.current = normalizedName;
+    deviceTokenRef.current = normalizedToken;
     setDeviceIdentity({
       deviceUid: normalizedUid,
       deviceName: normalizedName,
+      deviceToken: normalizedToken,
     });
   };
 
@@ -293,10 +316,34 @@ export default function AutoCallScreen() {
     return normalizedUid || null;
   };
 
-  const applyDeviceFromServer = (device?: ServerDevice | null) => {
-    if (!device || typeof device !== "object") {
+  const getCurrentDeviceCredentials = async (): Promise<{
+    deviceUid: string;
+    deviceToken: string | null;
+  } | null> => {
+    const deviceUid = await getCurrentDeviceUid();
+    if (!deviceUid) return null;
+
+    const cachedToken = normalizeDeviceToken(deviceTokenRef.current);
+    if (cachedToken) {
+      deviceTokenRef.current = cachedToken;
+      return { deviceUid, deviceToken: cachedToken };
+    }
+
+    const identity = await refreshDeviceIdentity();
+    const normalizedToken = normalizeDeviceToken(identity?.deviceToken);
+    deviceTokenRef.current = normalizedToken;
+    return {
+      deviceUid,
+      deviceToken: normalizedToken || null,
+    };
+  };
+
+  const applyDeviceFromServer = async (response?: ServerDeviceResponse | null) => {
+    if (!response || typeof response !== "object") {
       return;
     }
+    const device = response.device;
+    if (!device || typeof device !== "object") return;
 
     const serverUid = normalizeDeviceUid(device.deviceUid);
     if (!serverUid) {
@@ -308,19 +355,37 @@ export default function AutoCallScreen() {
       return;
     }
 
+    const serverToken = normalizeDeviceToken(response.deviceToken);
     const serverName =
       typeof device.deviceName === "string" && device.deviceName.trim()
         ? device.deviceName.trim()
         : "";
-    if (!serverName) {
-      return;
+
+    if (serverUid) {
+      try {
+        const syncedIdentity = await syncDeviceIdentity(
+          serverUid,
+          serverName || null,
+          serverToken || null
+        );
+        applyDeviceIdentity(syncedIdentity);
+        return;
+      } catch (error) {
+        logEvent("device_identity_sync_failed", { error });
+      }
     }
 
     deviceUidRef.current = currentUid;
-    deviceNameRef.current = serverName;
+    if (serverName) {
+      deviceNameRef.current = serverName;
+    }
+    if (serverToken) {
+      deviceTokenRef.current = serverToken;
+    }
     setDeviceIdentity(() => ({
       deviceUid: currentUid,
-      deviceName: serverName,
+      deviceName: serverName || deviceNameRef.current,
+      deviceToken: serverToken || deviceTokenRef.current,
     }));
   };
 
@@ -421,24 +486,33 @@ export default function AutoCallScreen() {
 
   const registerDevice = async () => {
     try {
-      const deviceUid = await getCurrentDeviceUid();
-      if (!deviceUid) {
+      const credentials = await getCurrentDeviceCredentials();
+      if (!credentials) {
         logEvent("register_device_skipped_missing_uid");
         return;
       }
+      const { deviceUid, deviceToken } = credentials;
 
       const response = await fetch(`${SERVER}/devices/register`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceUid }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-Device-Uid": deviceUid,
+          ...(deviceToken ? { "X-Device-Token": deviceToken } : {}),
+        },
+        body: JSON.stringify({
+          deviceUid,
+          deviceToken: deviceToken || null,
+        }),
       });
 
       if (!response.ok) {
+        logEvent("register_device_rejected", { code: response.status, deviceUid });
         return;
       }
 
-      const data = (await response.json()) as { device?: ServerDevice | null };
-      applyDeviceFromServer(data.device);
+      const data = (await response.json()) as ServerDeviceResponse;
+      await applyDeviceFromServer(data);
     } catch (error) {
       logEvent("register_device_failed", { error });
     }
@@ -446,24 +520,33 @@ export default function AutoCallScreen() {
 
   const sendHeartbeat = async () => {
     try {
-      const deviceUid = await getCurrentDeviceUid();
-      if (!deviceUid) {
+      const credentials = await getCurrentDeviceCredentials();
+      if (!credentials) {
         logEvent("heartbeat_skipped_missing_uid");
         return;
       }
+      const { deviceUid, deviceToken } = credentials;
 
       const response = await fetch(`${SERVER}/devices/heartbeat`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceUid }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-Device-Uid": deviceUid,
+          ...(deviceToken ? { "X-Device-Token": deviceToken } : {}),
+        },
+        body: JSON.stringify({
+          deviceUid,
+          deviceToken: deviceToken || null,
+        }),
       });
 
       if (!response.ok) {
+        logEvent("heartbeat_rejected", { code: response.status, deviceUid });
         return;
       }
 
-      const data = (await response.json()) as { device?: ServerDevice | null };
-      applyDeviceFromServer(data.device);
+      const data = (await response.json()) as ServerDeviceResponse;
+      await applyDeviceFromServer(data);
     } catch (error) {
       logEvent("heartbeat_failed", { error });
     }
@@ -476,11 +559,28 @@ export default function AutoCallScreen() {
     downloadDurationSeconds?: number | null
   ) => {
     try {
+      const credentials = await getCurrentDeviceCredentials();
+      if (!credentials) {
+        logEvent("command_status_update_skipped_missing_device_credentials", {
+          commandId: id,
+          status,
+        });
+        return;
+      }
+
       const payload: {
+        deviceUid: string;
+        deviceToken?: string | null;
         status: string;
         failureReason?: string;
         downloadDurationSeconds?: number;
-      } = { status };
+      } = {
+        deviceUid: credentials.deviceUid,
+        status,
+      };
+      if (credentials.deviceToken) {
+        payload.deviceToken = credentials.deviceToken;
+      }
       if (typeof failureReason === "string" && failureReason.trim()) {
         payload.failureReason = failureReason.trim();
       }
@@ -499,7 +599,11 @@ export default function AutoCallScreen() {
       });
       const response = await fetch(`${SERVER}/commands/${id}/status`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: {
+          "Content-Type": "application/json",
+          "X-Device-Uid": credentials.deviceUid,
+          ...(credentials.deviceToken ? { "X-Device-Token": credentials.deviceToken } : {}),
+        },
         body: JSON.stringify(payload),
       });
       if (!response.ok) {
@@ -549,18 +653,26 @@ export default function AutoCallScreen() {
   };
 
   const claimNextCommand = async (): Promise<ServerCallCommand | null> => {
-    const deviceUid = await getCurrentDeviceUid();
-    if (!deviceUid) {
+    const credentials = await getCurrentDeviceCredentials();
+    if (!credentials) {
       logEvent("claim_command_skipped_missing_uid");
       return null;
     }
+    const { deviceUid, deviceToken } = credentials;
 
     try {
       logEvent("claim_command_request", { deviceUid });
       const response = await fetch(`${SERVER}/commands/claim`, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ deviceUid }),
+        headers: {
+          "Content-Type": "application/json",
+          "X-Device-Uid": deviceUid,
+          ...(deviceToken ? { "X-Device-Token": deviceToken } : {}),
+        },
+        body: JSON.stringify({
+          deviceUid,
+          deviceToken: deviceToken || null,
+        }),
       });
       if (!response.ok) {
         logEvent("claim_command_rejected", {
@@ -1845,7 +1957,18 @@ export default function AutoCallScreen() {
   }, []);
 
   return (
-    <View style={styles.screen}>
+    <ImageBackground
+      source={require("../assets/images/android-icon-background.png")}
+      style={styles.screen}
+      resizeMode="cover"
+    >
+      <View style={styles.headerLogoShell}>
+        <Image
+          source={require("../assets/images/splash-icon.png")}
+          style={styles.headerLogo}
+          resizeMode="cover"
+        />
+      </View>
       {downloadSuccessBannerVisible ? (
         <View style={styles.successBanner}>
           <Text style={styles.successBannerText}>{DOWNLOAD_DATA_SUCCESS_MESSAGE}</Text>
@@ -1858,7 +1981,16 @@ export default function AutoCallScreen() {
         <View style={styles.section}>
           <View style={styles.rowBetween}>
             <Text style={styles.label}>Auto Answer</Text>
-            <Switch value={uiState.autoAnswerEnabled} onValueChange={onToggleAutoAnswer} />
+            <Switch
+              value={uiState.autoAnswerEnabled}
+              onValueChange={onToggleAutoAnswer}
+              thumbColor={uiState.autoAnswerEnabled ? "#4BF5FF" : "#FFFFFF"}
+              trackColor={{
+                false: "rgba(255,255,255,0.22)",
+                true: "rgba(16,97,255,0.76)",
+              }}
+              ios_backgroundColor="rgba(255,255,255,0.24)"
+            />
           </View>
 
           <Text style={styles.label}>Auto Hangup Seconds</Text>
@@ -1867,11 +1999,15 @@ export default function AutoCallScreen() {
               value={autoHangupSecondsText}
               onChangeText={setAutoHangupSecondsText}
               keyboardType="number-pad"
-              style={[styles.input, styles.secondsInput]}
+              style={[styles.input , styles.secondsInput]}
               placeholder="20"
-              placeholderTextColor="#8ca0bf"
+              placeholderTextColor="rgba(255,255,255,0.45)"
             />
-            <Pressable style={styles.secondaryButton} onPress={onApplyHangupSeconds}>
+            <Pressable
+              style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]}
+              onPress={onApplyHangupSeconds}
+              android_ripple={{ color: "rgba(75,245,255,0.18)" }}
+            >
               <Text style={styles.secondaryButtonText}>Apply</Text>
             </Pressable>
           </View>
@@ -1879,7 +2015,11 @@ export default function AutoCallScreen() {
 
         <View style={styles.section}>
           <View style={styles.row}>
-            <Pressable style={styles.primaryButton} onPress={onEnableScreenMirroring}>
+            <Pressable
+              style={({ pressed }) => [styles.primaryButton, pressed && styles.buttonPressed]}
+              onPress={onEnableScreenMirroring}
+              android_ripple={{ color: "rgba(75,245,255,0.18)" }}
+            >
               <Text style={styles.primaryButtonText}>Enable Screen Mirroring</Text>
             </Pressable>
           </View>
@@ -1896,17 +2036,19 @@ export default function AutoCallScreen() {
           </Text>
         </View>
       </View>
-    </View>
+    </ImageBackground>
   );
 }
 
 const styles = StyleSheet.create({
   screen: {
     flex: 1,
-    backgroundColor: "#0f1627",
+    backgroundColor: "#000050",
     justifyContent: "center",
     alignItems: "center",
     padding: 16,
+    experimental_backgroundImage:
+      "linear-gradient(160deg, rgba(0,0,80,0.56) 0%, rgba(0,0,40,0.48) 45%, rgba(0,0,24,0.62) 100%)",
   },
   successBanner: {
     position: "absolute",
@@ -1914,46 +2056,184 @@ const styles = StyleSheet.create({
     left: 16,
     right: 16,
     zIndex: 20,
-    backgroundColor: "#1f9d79",
-    borderColor: "#5ce0b8",
+    backgroundColor: "rgba(8,20,82,0.76)",
+    experimental_backgroundImage:
+      "linear-gradient(136deg, rgba(75,245,255,0.2) 0%, rgba(16,97,255,0.3) 56%, rgba(255,255,255,0.08) 100%)",
+    borderColor: "rgba(75,245,255,0.64)",
     borderWidth: 1,
-    borderRadius: 12,
+    borderRadius: 18,
     paddingVertical: 10,
     paddingHorizontal: 12,
+    overflow: "hidden",
+    shadowColor: "#4BF5FF",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.34,
+    shadowRadius: 18,
+    elevation: 12,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 8,
+        blurRadius: 24,
+        color: "rgba(0,0,80,0.52)",
+      },
+      {
+        offsetX: 0,
+        offsetY: 0,
+        blurRadius: 0,
+        spreadDistance: 1,
+        color: "rgba(75,245,255,0.38)",
+        inset: true,
+      },
+    ],
+  },
+  headerLogoShell: {
+    position: "absolute",
+    top: "5%",
+    left: 16,
+    zIndex: 30,
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "center",
+    padding: 6,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.28)",
+    backgroundColor: "rgba(255,255,255,0.08)",
+    experimental_backgroundImage:
+      "linear-gradient(145deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.06))",
+    shadowColor: "#04081A",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.36,
+    shadowRadius: 24,
+    elevation: 12,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 10,
+        blurRadius: 24,
+        color: "rgba(4, 8, 26, 0.36)",
+      },
+    ],
+  },
+  headerLogo: {
+    width: 56,
+    height: 56,
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: "rgba(255, 255, 255, 0.35)",
+    shadowColor: "#000000",
+    shadowOffset: { width: 0, height: 6 },
+    shadowOpacity: 0.24,
+    shadowRadius: 14,
+    elevation: 8,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 6,
+        blurRadius: 14,
+        color: "rgba(0, 0, 0, 0.24)",
+      },
+    ],
   },
   successBannerText: {
-    color: "#eafff8",
+    color: "#FFFFFF",
     fontSize: 13,
     fontWeight: "700",
     textAlign: "center",
+    textShadowColor: "rgba(75,245,255,0.4)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 7,
   },
   card: {
     width: "100%",
     maxWidth: 460,
-    backgroundColor: "#1b2740",
-    borderRadius: 16,
-    padding: 16,
+    backgroundColor: "rgba(10, 18, 48, 0.44)",
+    experimental_backgroundImage:
+      "linear-gradient(150deg, rgba(255,255,255,0.12) 0%, rgba(16,97,255,0.22) 42%, rgba(8,14,52,0.5) 100%), radial-gradient(circle at 8% 0%, rgba(255,255,255,0.38) 0%, rgba(255,255,255,0) 58%), linear-gradient(90deg, rgba(255,255,255,0) 0%, rgba(255,255,255,0.26) 24%, rgba(255,255,255,0.12) 58%, rgba(255,255,255,0) 100%)",
+    borderRadius: 28,
+    padding: 18,
     borderWidth: 1,
-    borderColor: "#324869",
+    borderColor: "rgba(255,255,255,0.22)",
+    overflow: "hidden",
+    shadowColor: "#000050",
+    shadowOffset: { width: 0, height: 14 },
+    shadowOpacity: 0.36,
+    shadowRadius: 24,
+    elevation: 18,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 22,
+        blurRadius: 58,
+        color: "rgba(0,0,80,0.72)",
+      },
+      {
+        offsetX: 0,
+        offsetY: 0,
+        blurRadius: 0,
+        spreadDistance: 1,
+        color: "rgba(255,255,255,0.18)",
+        inset: true,
+      },
+      {
+        offsetX: 0,
+        offsetY: -1,
+        blurRadius: 0,
+        color: "rgba(255,255,255,0.24)",
+        inset: true,
+      },
+    ],
+    borderBottomColor: "rgba(255,255,255,0.22)",
   },
   title: {
     fontSize: 26,
-    fontWeight: "700",
-    color: "#ffffff",
+    fontWeight: "800",
+    letterSpacing: 0.4,
+    color: "#FFFFFF",
+    textShadowColor: "rgba(75,245,255,0.32)",
+    textShadowOffset: { width: 0, height: 2 },
+    textShadowRadius: 12,
   },
   subtitle: {
     marginTop: 4,
     marginBottom: 12,
     fontSize: 14,
-    color: "#b8c7de",
+    color: "rgba(255,255,255,0.72)",
+    letterSpacing: 0.2,
   },
   section: {
     marginTop: 12,
-    padding: 12,
-    borderRadius: 12,
-    backgroundColor: "#152037",
+    padding: 13,
+    borderRadius: 20,
+    backgroundColor: "rgba(12, 19, 52, 0.42)",
+    experimental_backgroundImage:
+      "linear-gradient(150deg, rgba(255,255,255,0.1) 0%, rgba(16,97,255,0.18) 42%, rgba(8,14,52,0.44) 100%), radial-gradient(circle at 8% 0%, rgba(255,255,255,0.28) 0%, rgba(255,255,255,0) 56%)",
     borderWidth: 1,
-    borderColor: "#273a58",
+    borderColor: "rgba(255,255,255,0.2)",
+    overflow: "hidden",
+    shadowColor: "#000050",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.28,
+    shadowRadius: 16,
+    elevation: 90,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 10,
+        blurRadius: 26,
+        color: "rgba(0,0,80,0.45)",
+      },
+      {
+        offsetX: 0,
+        offsetY: 0,
+        blurRadius: 0,
+        spreadDistance: 1,
+        color: "rgba(255,255,255,0.16)",
+        inset: true,
+      },
+    ],
+    borderBottomColor: "rgba(255,255,255,0.22)",
   },
   rowBetween: {
     flexDirection: "row",
@@ -1970,7 +2250,8 @@ const styles = StyleSheet.create({
   label: {
     fontSize: 14,
     fontWeight: "600",
-    color: "#dde7f8",
+    color: "#FFFFFF",
+    letterSpacing: 0.2,
   },
   durationLabel: {
     marginTop: 10,
@@ -1978,17 +2259,40 @@ const styles = StyleSheet.create({
   helperText: {
     marginTop: 6,
     fontSize: 12,
-    color: "#9eb0cc",
+    color: "rgba(255,255,255,0.62)",
     lineHeight: 18,
   },
   input: {
     borderWidth: 1,
-    borderColor: "#34507a",
-    borderRadius: 10,
+    borderColor: "rgba(255,255,255,0.24)",
+    borderRadius: 14,
     paddingHorizontal: 10,
     paddingVertical: 9,
-    color: "#ffffff",
-    backgroundColor: "#101a2d",
+    color: "#FFFFFF",
+    backgroundColor: "rgba(7, 14, 44, 0.5)",
+    experimental_backgroundImage:
+      "linear-gradient(145deg, rgba(255,255,255,0.1) 0%, rgba(16,97,255,0.12) 40%, rgba(0,0,80,0.42) 100%)",
+    shadowColor: "#1061FF",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.24,
+    shadowRadius: 12,
+    elevation: 90,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 8,
+        blurRadius: 18,
+        color: "rgba(0,0,80,0.38)",
+      },
+      {
+        offsetX: 0,
+        offsetY: 0,
+        blurRadius: 0,
+        spreadDistance: 1,
+        color: "rgba(255,255,255,0.18)",
+        inset: true,
+      },
+    ],
   },
   fullInput: {
     width: "100%",
@@ -2006,54 +2310,148 @@ const styles = StyleSheet.create({
   },
   primaryButton: {
     flex: 1,
-    borderRadius: 10,
-    backgroundColor: "#27c596",
+    borderRadius: 14,
+    backgroundColor: "rgba(10,48,182,0.6)",
+    experimental_backgroundImage:
+      "linear-gradient(135deg, rgba(75,245,255,0.36) 0%, rgba(16,97,255,0.9) 52%, rgba(0,0,80,0.78) 100%), radial-gradient(circle at 0% 0%, rgba(255,255,255,0.24) 0%, rgba(0,0,0,0) 56%)",
     paddingVertical: 10,
     alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(75,245,255,0.58)",
+    overflow: "hidden",
+    shadowColor: "#4BF5FF",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.34,
+    shadowRadius: 18,
+    elevation: 10,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 12,
+        blurRadius: 22,
+        color: "rgba(16,97,255,0.5)",
+      },
+      {
+        offsetX: 0,
+        offsetY: 0,
+        blurRadius: 0,
+        spreadDistance: 1,
+        color: "rgba(75,245,255,0.42)",
+        inset: true,
+      },
+    ],
   },
   primaryButtonText: {
-    color: "#062019",
+    color: "#FFFFFF",
     fontWeight: "700",
+    textShadowColor: "rgba(75,245,255,0.32)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 8,
   },
   secondaryButton: {
-    borderRadius: 10,
-    backgroundColor: "#89a7ff",
+    borderRadius: 14,
+    backgroundColor: "rgba(8,28,112,0.58)",
+    experimental_backgroundImage:
+      "linear-gradient(135deg, rgba(255,255,255,0.2) 0%, rgba(16,97,255,0.7) 46%, rgba(0,0,80,0.72) 100%)",
     paddingVertical: 10,
     paddingHorizontal: 14,
     alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(75,245,255,0.5)",
+    overflow: "hidden",
+    shadowColor: "#1061FF",
+    shadowOffset: { width: 0, height: 8 },
+    shadowOpacity: 0.28,
+    shadowRadius: 14,
+    elevation: 8,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 8,
+        blurRadius: 20,
+        color: "rgba(0,0,80,0.4)",
+      },
+      {
+        offsetX: 0,
+        offsetY: 0,
+        blurRadius: 0,
+        spreadDistance: 1,
+        color: "rgba(75,245,255,0.35)",
+        inset: true,
+      },
+    ],
   },
   secondaryButtonText: {
-    color: "#101d3a",
+    color: "#FFFFFF",
     fontWeight: "700",
+    textShadowColor: "rgba(75,245,255,0.26)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 7,
+  },
+  buttonPressed: {
+    transform: [{ scale: 0.985 }],
+    opacity: 0.94,
   },
   dangerButton: {
     flex: 1,
-    borderRadius: 10,
-    backgroundColor: "#e25f7c",
+    borderRadius: 14,
+    backgroundColor: "rgba(80,18,15,0.72)",
+    experimental_backgroundImage:
+      "linear-gradient(140deg, rgba(255,90,60,0.42) 0%, rgba(86,18,16,0.78) 100%)",
     paddingVertical: 10,
     alignItems: "center",
+    borderWidth: 1,
+    borderColor: "rgba(255,90,60,0.62)",
   },
   dangerButtonText: {
-    color: "#2b0814",
+    color: "#FFFFFF",
     fontWeight: "700",
   },
   statusBox: {
     marginTop: 12,
-    borderRadius: 12,
-    backgroundColor: "#101b2f",
+    borderRadius: 20,
+    backgroundColor: "rgba(10, 18, 50, 0.4)",
+    experimental_backgroundImage:
+      "linear-gradient(150deg, rgba(255,255,255,0.1) 0%, rgba(16,97,255,0.16) 40%, rgba(0,0,80,0.45) 100%), radial-gradient(circle at 8% 0%, rgba(255,255,255,0.3) 0%, rgba(255,255,255,0) 56%)",
     borderWidth: 1,
-    borderColor: "#273a58",
+    borderColor: "rgba(255,255,255,0.2)",
     padding: 12,
+    overflow: "hidden",
+    shadowColor: "#000050",
+    shadowOffset: { width: 0, height: 10 },
+    shadowOpacity: 0.26,
+    shadowRadius: 16,
+    elevation: 8,
+    boxShadow: [
+      {
+        offsetX: 0,
+        offsetY: 10,
+        blurRadius: 24,
+        color: "rgba(0,0,80,0.42)",
+      },
+      {
+        offsetX: 0,
+        offsetY: 0,
+        blurRadius: 0,
+        spreadDistance: 1,
+        color: "rgba(255,255,255,0.16)",
+        inset: true,
+      },
+    ],
+    borderBottomColor: "rgba(255,255,255,0.22)",
   },
   statusLine: {
-    color: "#e6efff",
+    color: "#FFFFFF",
     fontSize: 16,
     lineHeight: 22,
     fontWeight: "600",
     marginBottom: 4,
+    textShadowColor: "rgba(16,97,255,0.24)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 5,
   },
   statusMessage: {
-    color: "#7fe3ca",
+    color: "rgba(75,245,255,0.92)",
     fontSize: 13,
     marginTop: 8,
     fontWeight: "600",

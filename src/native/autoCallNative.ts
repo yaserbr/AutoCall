@@ -11,6 +11,7 @@ export type AutoAnswerStatus = {
 export type DeviceIdentity = {
   deviceUid: string;
   deviceName: string;
+  deviceToken: string;
 };
 
 export type InAppWebViewState = {
@@ -91,6 +92,11 @@ type AutoCallNativeModule = {
   disableAutoAnswer(): Promise<AutoAnswerStatus>;
   getAutoAnswerStatus(): Promise<AutoAnswerStatus>;
   getDeviceIdentity(): Promise<DeviceIdentity>;
+  syncDeviceIdentity(
+    deviceUid: string | null,
+    deviceName: string | null,
+    deviceToken: string | null
+  ): Promise<DeviceIdentity>;
   endCurrentCall(): Promise<{ ended: boolean }>;
   openInAppWebView(url: string): Promise<InAppWebViewCommandResult>;
   closeInAppWebView(): Promise<InAppWebViewCommandResult>;
@@ -128,6 +134,12 @@ export const disableAutoAnswer = () => getNativeModule().disableAutoAnswer();
 export const getStatus = () => getNativeModule().getAutoAnswerStatus();
 
 export const getDeviceIdentity = () => getNativeModule().getDeviceIdentity();
+
+export const syncDeviceIdentity = (
+  deviceUid?: string | null,
+  deviceName?: string | null,
+  deviceToken?: string | null
+) => getNativeModule().syncDeviceIdentity(deviceUid ?? null, deviceName ?? null, deviceToken ?? null);
 
 export const endCurrentCall = async () => {
   return getNativeModule().endCurrentCall();

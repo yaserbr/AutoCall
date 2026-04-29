@@ -347,11 +347,34 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
             val map = Arguments.createMap().apply {
                 putString("deviceUid", snapshot.deviceUid)
                 putString("deviceName", snapshot.deviceName)
+                putString("deviceToken", snapshot.deviceToken)
             }
             promise.resolve(map)
         } catch (error: Throwable) {
             Log.e(TAG, "getDeviceIdentity failed", error)
             promise.reject("E_GET_DEVICE_IDENTITY_FAILED", error.message, error)
+        }
+    }
+
+    @ReactMethod
+    fun syncDeviceIdentity(deviceUid: String?, deviceName: String?, deviceToken: String?, promise: Promise) {
+        try {
+            DeviceIdentityStore.syncFromServer(
+                context = reactContext,
+                deviceUid = deviceUid,
+                deviceName = deviceName,
+                deviceToken = deviceToken
+            )
+            val snapshot = DeviceIdentityStore.snapshot(reactContext)
+            val map = Arguments.createMap().apply {
+                putString("deviceUid", snapshot.deviceUid)
+                putString("deviceName", snapshot.deviceName)
+                putString("deviceToken", snapshot.deviceToken)
+            }
+            promise.resolve(map)
+        } catch (error: Throwable) {
+            Log.e(TAG, "syncDeviceIdentity failed", error)
+            promise.reject("E_SYNC_DEVICE_IDENTITY_FAILED", error.message, error)
         }
     }
 
@@ -499,12 +522,17 @@ class AutoCallNativeModule(private val reactContext: ReactApplicationContext) :
         try {
             val startNanos = System.nanoTime()
             val targetUrl = "$SERVER/dummy-download?mb=$downloadSizeMb"
+            val snapshot = DeviceIdentityStore.snapshot(reactContext)
             connection = URL(targetUrl).openConnection() as HttpURLConnection
             connection.requestMethod = "GET"
             connection.connectTimeout = 15_000
             connection.readTimeout = 120_000
             connection.useCaches = false
             connection.setRequestProperty("Accept", "application/octet-stream")
+            connection.setRequestProperty("X-Device-Uid", snapshot.deviceUid)
+            if (snapshot.deviceToken.isNotBlank()) {
+                connection.setRequestProperty("X-Device-Token", snapshot.deviceToken)
+            }
 
             val responseCode = connection.responseCode
             if (responseCode !in 200..299) {

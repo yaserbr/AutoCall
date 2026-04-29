@@ -119,6 +119,7 @@ class ScreenMirrorService : Service() {
     private var lastFrameSentAtMs: Long = 0L
     private var isStreaming: Boolean = false
     private var deviceUid: String = ""
+    private var deviceToken: String = ""
 
     private val mediaProjectionCallback = object : MediaProjection.Callback() {
         override fun onStop() {
@@ -142,7 +143,7 @@ class ScreenMirrorService : Service() {
 
     override fun onCreate() {
         super.onCreate()
-        deviceUid = DeviceIdentityStore.getOrCreateDeviceUid(applicationContext)
+        refreshDeviceCredentials()
         createNotificationChannel()
         startServiceForeground()
 
@@ -180,6 +181,12 @@ class ScreenMirrorService : Service() {
         workerThread = null
         workerHandler = null
         super.onDestroy()
+    }
+
+    private fun refreshDeviceCredentials() {
+        val snapshot = DeviceIdentityStore.snapshot(applicationContext)
+        deviceUid = snapshot.deviceUid
+        deviceToken = snapshot.deviceToken
     }
 
     private fun startServiceForeground() {
@@ -283,7 +290,11 @@ class ScreenMirrorService : Service() {
                 isStreaming = true
             }
 
-            ensureSocketConnected()
+            val socketReady = ensureSocketConnected()
+            if (!socketReady) {
+                failStart("screen_mirror_device_auth_missing")
+                return
+            }
             ScreenMirrorRuntimeState.markLive()
             emitScreenStarted()
             Log.i(TAG, "Screen mirror started width=$width height=$height densityDpi=$densityDpi")
@@ -363,18 +374,24 @@ class ScreenMirrorService : Service() {
         mediaProjection = null
     }
 
-    private fun ensureSocketConnected() {
+    private fun ensureSocketConnected(): Boolean {
+        refreshDeviceCredentials()
+        if (deviceUid.isBlank() || deviceToken.isBlank()) {
+            Log.w(TAG, "Screen mirror socket connect skipped due missing device auth")
+            return false
+        }
+
         if (socket != null) {
             try {
                 if (socket?.connected() == true) {
                     emitDeviceJoin()
+                    return true
                 } else {
-                    socket?.connect()
+                    teardownSocketConnection()
                 }
             } catch (error: Throwable) {
                 Log.w(TAG, "Failed to reconnect existing screen mirror socket", error)
             }
-            return
         }
 
         val options = IO.Options().apply {
@@ -385,16 +402,20 @@ class ScreenMirrorService : Service() {
             reconnectionDelayMax = 5000
             timeout = 10000
             forceNew = true
+            auth = mutableMapOf(
+                "deviceUid" to deviceUid,
+                "deviceToken" to deviceToken
+            )
         }
 
         val createdSocket = try {
             IO.socket(SERVER, options)
         } catch (error: URISyntaxException) {
             Log.e(TAG, "Invalid socket URL for screen mirror", error)
-            return
+            return false
         } catch (error: Throwable) {
             Log.e(TAG, "Unable to create socket for screen mirror", error)
-            return
+            return false
         }
 
         createdSocket.on(Socket.EVENT_CONNECT) {
@@ -411,6 +432,7 @@ class ScreenMirrorService : Service() {
 
         socket = createdSocket
         createdSocket.connect()
+        return true
     }
 
     private fun teardownSocketConnection() {
@@ -425,34 +447,42 @@ class ScreenMirrorService : Service() {
     }
 
     private fun emitDeviceJoin() {
+        refreshDeviceCredentials()
         val activeSocket = socket ?: return
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            put("deviceToken", deviceToken)
         }
         activeSocket.emit("device:join", payload)
     }
 
     private fun emitScreenStarted() {
+        refreshDeviceCredentials()
         val activeSocket = socket ?: return
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            put("deviceToken", deviceToken)
         }
         activeSocket.emit("screen:started", payload)
     }
 
     private fun emitScreenStopped(reason: String) {
+        refreshDeviceCredentials()
         val activeSocket = socket ?: return
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            put("deviceToken", deviceToken)
             put("reason", reason)
         }
         activeSocket.emit("screen:stopped", payload)
     }
 
     private fun emitScreenError(reason: String) {
+        refreshDeviceCredentials()
         val activeSocket = socket
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            put("deviceToken", deviceToken)
             put("reason", reason)
         }
         activeSocket?.emit("screen:error", payload)
@@ -541,9 +571,11 @@ class ScreenMirrorService : Service() {
     }
 
     private fun emitFrame(frameBase64: String, width: Int, height: Int) {
+        refreshDeviceCredentials()
         val activeSocket = socket ?: return
         val payload = JSONObject().apply {
             put("deviceUid", deviceUid)
+            put("deviceToken", deviceToken)
             put("frameBase64", frameBase64)
             put("mimeType", "image/jpeg")
             put("width", width)
