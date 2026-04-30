@@ -1,11 +1,14 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  Animated,
   AppState,
   Image,
   ImageBackground,
+  NativeModules,
   PermissionsAndroid,
   Platform,
   Pressable,
+  StatusBar,
   StyleSheet,
   Switch,
   Text,
@@ -57,6 +60,8 @@ const DEVICE_UID_REGEX = /^[a-z0-9]{5}$/;
 const DEVICE_TOKEN_REGEX = /^[a-f0-9]{64}$/;
 const DOWNLOAD_DATA_SUCCESS_MESSAGE = "Download data command executed successfully";
 const DOWNLOAD_DATA_BANNER_DURATION_MS = 10_000;
+const INTRO_SCREEN_DURATION_MS = 3000;
+const INTRO_SCREEN_FADE_MS = 320;
 
 type ServerCallCommand = {
   id: string;
@@ -257,7 +262,10 @@ export default function AutoCallScreen() {
   const [screenMirrorState, setScreenMirrorState] =
     useState<ScreenMirrorState>(emptyScreenMirrorState);
   const [downloadSuccessBannerVisible, setDownloadSuccessBannerVisible] = useState(false);
+  const [showIntroOverlay, setShowIntroOverlay] = useState(true);
   const downloadSuccessBannerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const introOverlayOpacity = useRef(new Animated.Value(1)).current;
+  const introOverlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastHandledDownloadSuccessEventAtRef = useRef(0);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
   const processedCommandIds = useRef<Set<string>>(new Set());
@@ -431,6 +439,10 @@ export default function AutoCallScreen() {
       downloadSuccessBannerTimeoutRef.current = null;
     }, DOWNLOAD_DATA_BANNER_DURATION_MS);
   };
+
+  useEffect(() => {
+    console.log(`${LOG_PREFIX} NativeModules`, NativeModules);
+  }, []);
 
   useEffect(() => {
     const normalizedLastEventAt = Number(uiState.lastEventAt || 0);
@@ -1894,6 +1906,28 @@ export default function AutoCallScreen() {
   };
 
   useEffect(() => {
+    introOverlayTimerRef.current = setTimeout(() => {
+      Animated.timing(introOverlayOpacity, {
+        toValue: 0,
+        duration: INTRO_SCREEN_FADE_MS,
+        useNativeDriver: true,
+      }).start(({ finished }) => {
+        if (finished) {
+          setShowIntroOverlay(false);
+        }
+      });
+    }, INTRO_SCREEN_DURATION_MS);
+
+    return () => {
+      if (introOverlayTimerRef.current) {
+        clearTimeout(introOverlayTimerRef.current);
+        introOverlayTimerRef.current = null;
+      }
+      introOverlayOpacity.stopAnimation();
+    };
+  }, [introOverlayOpacity]);
+
+  useEffect(() => {
     const subscription = AppState.addEventListener("change", (nextState) => {
       if (nextState === "active") {
         void refreshStatus();
@@ -1962,9 +1996,14 @@ export default function AutoCallScreen() {
       style={styles.screen}
       resizeMode="cover"
     >
+      <StatusBar
+        hidden={showIntroOverlay}
+        barStyle="light-content"
+        backgroundColor="#012065"
+      />
       <View style={styles.headerLogoShell}>
         <Image
-          source={require("../assets/images/splash-icon.png")}
+          source={require("../assets/images/header.png")}
           style={styles.headerLogo}
           resizeMode="cover"
         />
@@ -2036,6 +2075,15 @@ export default function AutoCallScreen() {
           </Text>
         </View>
       </View>
+      {showIntroOverlay ? (
+        <Animated.View style={[styles.introOverlay, { opacity: introOverlayOpacity }]}>
+          <ImageBackground
+            source={require("../assets/images/StartImage.png")}
+            style={styles.introOverlayImage}
+            resizeMode="cover"
+          />
+        </Animated.View>
+      ) : null}
     </ImageBackground>
   );
 }
@@ -2049,6 +2097,17 @@ const styles = StyleSheet.create({
     padding: 16,
     experimental_backgroundImage:
       "linear-gradient(160deg, rgba(0,0,80,0.56) 0%, rgba(0,0,40,0.48) 45%, rgba(0,0,24,0.62) 100%)",
+  },
+  introOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    zIndex: 999,
+    backgroundColor: "#012065",
+  },
+  introOverlayImage: {
+    flex: 1,
+    width: "100%",
+    height: "100%",
+    backgroundColor: "#012065",
   },
   successBanner: {
     position: "absolute",

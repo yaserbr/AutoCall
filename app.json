@@ -12,6 +12,7 @@
       "supportsTablet": true
     },
     "android": {
+      "icon": "./assets/images/icon.png",
       "permissions": [
         "CALL_PHONE",
         "ANSWER_PHONE_CALLS",
@@ -38,12 +39,9 @@
       [
         "expo-splash-screen",
         {
-          "image": "./assets/images/splash-icon.png",
-          "imageWidth": 200,
-          "resizeMode": "contain",
-          "backgroundColor": "#ffffff",
+          "backgroundColor": "#000B4F",
           "dark": {
-            "backgroundColor": "#000000"
+            "backgroundColor": "#000B4F"
           }
         }
       ]

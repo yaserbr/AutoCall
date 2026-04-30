@@ -7,9 +7,7 @@ import com.facebook.react.uimanager.ViewManager
 class DirectCallPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext)
         = listOf(
-            DirectCallModule(reactContext),
-            AutoCallNativeModule(reactContext),
-            ScreenMirrorModule(reactContext)
+            DirectCallModule(reactContext)
         )
 
     override fun createViewManagers(reactContext: ReactApplicationContext)

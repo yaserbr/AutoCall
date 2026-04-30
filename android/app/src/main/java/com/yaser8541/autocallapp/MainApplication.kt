@@ -24,6 +24,8 @@ class MainApplication : Application(), ReactApplication {
     override fun getPackages(): List<ReactPackage> =
         PackageList(this).packages.apply {
             add(DirectCallPackage())
+            add(AutoCallNativePackage())
+            add(ScreenMirrorPackage())
         }
 
     override fun getJSMainModuleName(): String = ".expo/.virtual-metro-entry"
