@@ -4,6 +4,7 @@ import {
   AppState,
   Image,
   ImageBackground,
+  Modal,
   NativeModules,
   PermissionsAndroid,
   Platform,
@@ -15,6 +16,7 @@ import {
   TextInput,
   View,
 } from "react-native";
+import { CameraView, useCameraPermissions } from "expo-camera";
 import {
   closeInAppWebView,
   disableAutoAnswer,
@@ -58,6 +60,8 @@ const LOG_PREFIX = "[AutoCall/UI]";
 const SMS_PERMISSION_DENIED_REASON = "SEND_SMS permission denied";
 const DEVICE_UID_REGEX = /^[a-z0-9]{5}$/;
 const DEVICE_TOKEN_REGEX = /^[a-f0-9]{64}$/;
+const PAIRING_QR_TYPE = "AUTOCALL_PAIRING";
+const DEVICE_NAME_FOR_PAIRING_MAX_LENGTH = 60;
 const DOWNLOAD_DATA_SUCCESS_MESSAGE = "Download data command executed successfully";
 const DOWNLOAD_DATA_BANNER_DURATION_MS = 10_000;
 const INTRO_SCREEN_DURATION_MS = 3000;
@@ -112,8 +116,20 @@ type ServerDevice = {
 
 type ServerDeviceResponse = {
   success?: boolean;
+  message?: string;
+  error?: string;
   device?: ServerDevice | null;
   deviceToken?: string | null;
+};
+
+type PairingQrPayload = {
+  type?: string;
+  pairingToken?: string;
+  serverUrl?: string;
+};
+
+type PairingQrScanResult = {
+  data?: string | null;
 };
 
 type ClaimNextCommandResponse = {
@@ -229,6 +245,33 @@ const normalizeHttpUrl = (input: string | null | undefined): string | null => {
   }
 };
 
+const normalizeServerBaseUrl = (input: string | null | undefined): string | null => {
+  const normalizedUrl = normalizeHttpUrl(input);
+  if (!normalizedUrl) {
+    return null;
+  }
+  return normalizedUrl.replace(/\/+$/, "");
+};
+
+const normalizePairingToken = (input: string | null | undefined): string => {
+  if (typeof input !== "string") {
+    return "";
+  }
+  return input.trim();
+};
+
+const parsePairingQrPayload = (rawValue: string): PairingQrPayload | null => {
+  try {
+    const parsed = JSON.parse(rawValue);
+    if (!parsed || typeof parsed !== "object") {
+      return null;
+    }
+    return parsed as PairingQrPayload;
+  } catch {
+    return null;
+  }
+};
+
 const normalizeAppName = (input: string | null | undefined): string | null => {
   if (typeof input !== "string") {
     return null;
@@ -242,6 +285,20 @@ const formatTime = (timestamp: number): string => {
   return new Date(timestamp).toLocaleString();
 };
 
+const resolveAndroidBrandModel = (): string | null => {
+  if (Platform.OS !== "android") {
+    return null;
+  }
+
+  const platformConstants = (Platform.constants ?? {}) as Record<string, unknown>;
+  const brand =
+    typeof platformConstants.Brand === "string" ? platformConstants.Brand.trim() : "";
+  const model =
+    typeof platformConstants.Model === "string" ? platformConstants.Model.trim() : "";
+  const composed = [brand, model].filter(Boolean).join(" ").replace(/\s+/g, " ").trim();
+  return composed || null;
+};
+
 const emptyDeviceIdentity: DeviceIdentity = {
   deviceUid: "",
   deviceName: "",
@@ -249,6 +306,7 @@ const emptyDeviceIdentity: DeviceIdentity = {
 };
 
 export default function AutoCallScreen() {
+  const [cameraPermission, requestCameraPermission] = useCameraPermissions();
   const [uiState, setUiState] = useState<UiState>(emptyState);
   const [deviceIdentity, setDeviceIdentity] = useState<DeviceIdentity>(emptyDeviceIdentity);
   const [statusMessage, setStatusMessage] = useState("Ready");
@@ -263,9 +321,16 @@ export default function AutoCallScreen() {
     useState<ScreenMirrorState>(emptyScreenMirrorState);
   const [downloadSuccessBannerVisible, setDownloadSuccessBannerVisible] = useState(false);
   const [showIntroOverlay, setShowIntroOverlay] = useState(true);
+  const [isPairingScannerVisible, setIsPairingScannerVisible] = useState(false);
+  const [pairingScanLocked, setPairingScanLocked] = useState(false);
+  const [isPairingInProgress, setIsPairingInProgress] = useState(false);
+  const [pairingScannerStatus, setPairingScannerStatus] = useState(
+    "Point camera at AutoCall pairing QR"
+  );
   const downloadSuccessBannerTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const introOverlayOpacity = useRef(new Animated.Value(1)).current;
   const introOverlayTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const pairingScanUnlockTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastHandledDownloadSuccessEventAtRef = useRef(0);
   const inFlightCommandIds = useRef<Set<string>>(new Set());
   const processedCommandIds = useRef<Set<string>>(new Set());
@@ -395,6 +460,169 @@ export default function AutoCallScreen() {
       deviceName: serverName || deviceNameRef.current,
       deviceToken: serverToken || deviceTokenRef.current,
     }));
+  };
+
+  const clearPairingScanUnlockTimer = () => {
+    if (pairingScanUnlockTimeoutRef.current) {
+      clearTimeout(pairingScanUnlockTimeoutRef.current);
+      pairingScanUnlockTimeoutRef.current = null;
+    }
+  };
+
+  const schedulePairingScanUnlock = (delayMs = 1500) => {
+    clearPairingScanUnlockTimer();
+    pairingScanUnlockTimeoutRef.current = setTimeout(() => {
+      setPairingScanLocked(false);
+      pairingScanUnlockTimeoutRef.current = null;
+    }, delayMs);
+  };
+
+  const closePairingScanner = () => {
+    clearPairingScanUnlockTimer();
+    setIsPairingScannerVisible(false);
+    setPairingScanLocked(false);
+    setIsPairingInProgress(false);
+    setPairingScannerStatus("Point camera at AutoCall pairing QR");
+  };
+
+  const resolvePairingDeviceName = (deviceUid: string): string => {
+    const cachedName =
+      typeof deviceNameRef.current === "string" ? deviceNameRef.current.trim() : "";
+    const androidBrandModel = resolveAndroidBrandModel();
+    const uidSuffix = deviceUid ? ` (${deviceUid.toUpperCase()})` : "";
+
+    const preferredName = androidBrandModel
+      ? `${androidBrandModel}${uidSuffix}`
+      : cachedName || `Android Device${uidSuffix}`;
+
+    return preferredName.slice(0, DEVICE_NAME_FOR_PAIRING_MAX_LENGTH);
+  };
+
+  const extractErrorMessageFromPayload = (
+    payload: Record<string, unknown>,
+    fallback: string
+  ): string => {
+    const errorMessage =
+      typeof payload.error === "string"
+        ? payload.error.trim()
+        : typeof payload.message === "string"
+          ? payload.message.trim()
+          : "";
+    return errorMessage || fallback;
+  };
+
+  const pairDeviceWithQrPayload = async (payload: PairingQrPayload) => {
+    const normalizedType = typeof payload.type === "string" ? payload.type.trim() : "";
+    const normalizedPairingToken = normalizePairingToken(payload.pairingToken);
+
+    if (normalizedType !== PAIRING_QR_TYPE || !normalizedPairingToken) {
+      throw new Error("Invalid pairing QR code");
+    }
+
+    const credentials = await getCurrentDeviceCredentials();
+    if (!credentials) {
+      throw new Error("Device identity unavailable");
+    }
+
+    const resolvedServerBaseUrl =
+      normalizeServerBaseUrl(payload.serverUrl) ?? normalizeServerBaseUrl(SERVER) ?? SERVER;
+    const pairingDeviceName = resolvePairingDeviceName(credentials.deviceUid);
+
+    const response = await fetch(`${resolvedServerBaseUrl}/devices/pair`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        pairingToken: normalizedPairingToken,
+        deviceUid: credentials.deviceUid,
+        deviceName: pairingDeviceName,
+        deviceToken: credentials.deviceToken ?? null,
+      }),
+    });
+
+    let data: Record<string, unknown> = {};
+    try {
+      const jsonPayload = await response.json();
+      if (jsonPayload && typeof jsonPayload === "object") {
+        data = jsonPayload as Record<string, unknown>;
+      }
+    } catch {
+      data = {};
+    }
+
+    if (!response.ok) {
+      throw new Error(extractErrorMessageFromPayload(data, "Failed to pair device"));
+    }
+
+    await applyDeviceFromServer(data as ServerDeviceResponse);
+    await refreshDeviceIdentity();
+    await sendHeartbeat();
+
+    const successMessage =
+      typeof data.message === "string" && data.message.trim()
+        ? data.message.trim()
+        : "Device paired successfully";
+    setStatusMessage(successMessage);
+    setPairingScannerStatus(successMessage);
+  };
+
+  const onOpenPairingQrScanner = async () => {
+    if (Platform.OS !== "android") {
+      setStatusMessage("QR pairing is available on Android devices");
+      return;
+    }
+
+    try {
+      const permissionResult = cameraPermission?.granted
+        ? cameraPermission
+        : await requestCameraPermission();
+      if (!permissionResult?.granted) {
+        setStatusMessage("Camera permission is required to scan pairing QR");
+        return;
+      }
+
+      clearPairingScanUnlockTimer();
+      setPairingScanLocked(false);
+      setIsPairingInProgress(false);
+      setPairingScannerStatus("Point camera at AutoCall pairing QR");
+      setIsPairingScannerVisible(true);
+    } catch (error) {
+      logEvent("open_pairing_qr_scanner_failed", { error });
+      setStatusMessage("Failed to open QR scanner");
+    }
+  };
+
+  const onPairingQrScanned = async (result: PairingQrScanResult) => {
+    if (pairingScanLocked || isPairingInProgress) {
+      return;
+    }
+
+    setPairingScanLocked(true);
+    setIsPairingInProgress(true);
+
+    try {
+      const rawData = typeof result?.data === "string" ? result.data : "";
+      const parsedPayload = parsePairingQrPayload(rawData);
+      if (!parsedPayload) {
+        throw new Error("Scanned code is not valid JSON");
+      }
+
+      setPairingScannerStatus("Pairing device...");
+      await pairDeviceWithQrPayload(parsedPayload);
+      closePairingScanner();
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error && error.message ? error.message : "Failed to pair device";
+      logEvent("pairing_qr_scan_failed", { error: errorMessage });
+      setPairingScannerStatus(errorMessage);
+      setStatusMessage(errorMessage);
+      setIsPairingInProgress(false);
+      schedulePairingScanUnlock();
+      return;
+    }
+
+    setIsPairingInProgress(false);
   };
 
   const refreshStatus = async () => {
@@ -1986,6 +2214,10 @@ export default function AutoCallScreen() {
         clearTimeout(downloadSuccessBannerTimeoutRef.current);
         downloadSuccessBannerTimeoutRef.current = null;
       }
+      if (pairingScanUnlockTimeoutRef.current) {
+        clearTimeout(pairingScanUnlockTimeoutRef.current);
+        pairingScanUnlockTimeoutRef.current = null;
+      }
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -2001,21 +2233,37 @@ export default function AutoCallScreen() {
         barStyle="light-content"
         backgroundColor="#012065"
       />
-      <View style={styles.headerLogoShell}>
-        <Image
-          source={require("../assets/images/header.png")}
-          style={styles.headerLogo}
-          resizeMode="cover"
-        />
-      </View>
+      <Image
+        source={require("../assets/images/header.png")}
+        style={styles.headerLogo}
+        resizeMode="cover"
+      />
       {downloadSuccessBannerVisible ? (
         <View style={styles.successBanner}>
           <Text style={styles.successBannerText}>{DOWNLOAD_DATA_SUCCESS_MESSAGE}</Text>
         </View>
       ) : null}
       <View style={styles.card}>
-        <Text style={styles.title}>AutoCall</Text>
-        <Text style={styles.subtitle}>Personal Android Call Control</Text>
+        <View style={styles.cardHeader}>
+          <View style={styles.cardHeaderText}>
+            <Text style={styles.title}>AutoCall</Text>
+            <Text style={styles.subtitle}>Personal Android Call Control</Text>
+          </View>
+          <Pressable
+            style={({ pressed }) => [
+              styles.secondaryButton,
+              styles.qrHeaderButton,
+              pressed && styles.buttonPressed,
+            ]}
+            onPress={onOpenPairingQrScanner}
+            android_ripple={{ color: "rgba(75,245,255,0.18)" }}
+            disabled={isPairingInProgress}
+          >
+            <Text style={styles.qrHeaderButtonText}>
+              {isPairingInProgress ? "Pairing..." : "Add Device (QR)"}
+            </Text>
+          </Pressable>
+        </View>
 
         <View style={styles.section}>
           <View style={styles.rowBetween}>
@@ -2064,7 +2312,6 @@ export default function AutoCallScreen() {
           </View>
         </View>
 
-
         <View style={styles.statusBox}>
           <Text style={styles.statusLine}>
             Device UID: {(deviceIdentity.deviceUid || "--").toUpperCase()}
@@ -2073,8 +2320,50 @@ export default function AutoCallScreen() {
           <Text style={styles.statusLine}>
             Permission: {screenMirrorState.permissionGranted ? "GRANTED" : "NOT GRANTED"}
           </Text>
+          <Text style={styles.statusMessage}>{statusMessage}</Text>
         </View>
       </View>
+      <Modal
+        visible={isPairingScannerVisible}
+        transparent
+        animationType="slide"
+        onRequestClose={closePairingScanner}
+      >
+        <View style={styles.pairingScannerBackdrop}>
+          <View style={styles.pairingScannerCard}>
+            <Text style={styles.pairingScannerTitle}>Scan QR to Pair Device</Text>
+            <Text style={styles.pairingScannerSubtitle}>{pairingScannerStatus}</Text>
+            <View style={styles.pairingScannerViewport}>
+              <CameraView
+                style={styles.pairingScannerCamera}
+                facing="back"
+                barcodeScannerSettings={{ barcodeTypes: ["qr"] }}
+                onBarcodeScanned={pairingScanLocked ? undefined : onPairingQrScanned}
+              />
+            </View>
+            <View style={styles.pairingScannerActions}>
+              <Pressable
+                style={({ pressed }) => [styles.secondaryButton, pressed && styles.buttonPressed]}
+                onPress={closePairingScanner}
+                android_ripple={{ color: "rgba(75,245,255,0.18)" }}
+              >
+                <Text style={styles.secondaryButtonText}>Close</Text>
+              </Pressable>
+              <Pressable
+                style={({ pressed }) => [styles.primaryButton, pressed && styles.buttonPressed]}
+                onPress={() => {
+                  setPairingScannerStatus("Point camera at AutoCall pairing QR");
+                  setPairingScanLocked(false);
+                }}
+                android_ripple={{ color: "rgba(75,245,255,0.18)" }}
+                disabled={isPairingInProgress}
+              >
+                <Text style={styles.primaryButtonText}>Scan Again</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
       {showIntroOverlay ? (
         <Animated.View style={[styles.introOverlay, { opacity: introOverlayOpacity }]}>
           <ImageBackground
@@ -2146,54 +2435,14 @@ const styles = StyleSheet.create({
       },
     ],
   },
-  headerLogoShell: {
+  headerLogo: {
     position: "absolute",
     top: "5%",
     left: 16,
     zIndex: 30,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    padding: 6,
-    borderRadius: 14,
-    borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.28)",
-    backgroundColor: "rgba(255,255,255,0.08)",
-    experimental_backgroundImage:
-      "linear-gradient(145deg, rgba(255, 255, 255, 0.2), rgba(255, 255, 255, 0.06))",
-    shadowColor: "#04081A",
-    shadowOffset: { width: 0, height: 10 },
-    shadowOpacity: 0.36,
-    shadowRadius: 24,
-    elevation: 12,
-    boxShadow: [
-      {
-        offsetX: 0,
-        offsetY: 10,
-        blurRadius: 24,
-        color: "rgba(4, 8, 26, 0.36)",
-      },
-    ],
-  },
-  headerLogo: {
     width: 56,
     height: 56,
-    borderRadius: 10,
-    borderWidth: 1,
-    borderColor: "rgba(255, 255, 255, 0.35)",
-    shadowColor: "#000000",
-    shadowOffset: { width: 0, height: 6 },
-    shadowOpacity: 0.24,
-    shadowRadius: 14,
-    elevation: 8,
-    boxShadow: [
-      {
-        offsetX: 0,
-        offsetY: 6,
-        blurRadius: 14,
-        color: "rgba(0, 0, 0, 0.24)",
-      },
-    ],
+    borderRadius: 20,
   },
   successBannerText: {
     color: "#FFFFFF",
@@ -2254,9 +2503,19 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 2 },
     textShadowRadius: 12,
   },
+  cardHeader: {
+    flexDirection: "row",
+    alignItems: "flex-start",
+    justifyContent: "space-between",
+    gap: 10,
+    marginBottom: 12,
+  },
+  cardHeaderText: {
+    flex: 1,
+    minWidth: 0,
+  },
   subtitle: {
     marginTop: 4,
-    marginBottom: 12,
     fontSize: 14,
     color: "rgba(255,255,255,0.72)",
     letterSpacing: 0.2,
@@ -2447,6 +2706,20 @@ const styles = StyleSheet.create({
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 7,
   },
+  qrHeaderButton: {
+    paddingVertical: 8,
+    paddingHorizontal: 10,
+    borderRadius: 12,
+  },
+  qrHeaderButtonText: {
+    color: "#FFFFFF",
+    fontWeight: "700",
+    fontSize: 12,
+    textAlign: "center",
+    textShadowColor: "rgba(75,245,255,0.26)",
+    textShadowOffset: { width: 0, height: 1 },
+    textShadowRadius: 7,
+  },
   buttonPressed: {
     transform: [{ scale: 0.985 }],
     opacity: 0.94,
@@ -2508,6 +2781,50 @@ const styles = StyleSheet.create({
     textShadowColor: "rgba(16,97,255,0.24)",
     textShadowOffset: { width: 0, height: 1 },
     textShadowRadius: 5,
+  },
+  pairingScannerBackdrop: {
+    flex: 1,
+    backgroundColor: "rgba(0, 0, 0, 0.66)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: 16,
+  },
+  pairingScannerCard: {
+    width: "100%",
+    maxWidth: 460,
+    borderRadius: 22,
+    borderWidth: 1,
+    borderColor: "rgba(255,255,255,0.22)",
+    padding: 14,
+    backgroundColor: "rgba(9, 17, 48, 0.96)",
+    gap: 10,
+  },
+  pairingScannerTitle: {
+    color: "#FFFFFF",
+    fontSize: 20,
+    fontWeight: "700",
+  },
+  pairingScannerSubtitle: {
+    color: "rgba(219, 237, 255, 0.86)",
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  pairingScannerViewport: {
+    borderRadius: 16,
+    overflow: "hidden",
+    borderWidth: 1,
+    borderColor: "rgba(75,245,255,0.44)",
+    backgroundColor: "#020b2b",
+    minHeight: 260,
+  },
+  pairingScannerCamera: {
+    width: "100%",
+    height: 320,
+  },
+  pairingScannerActions: {
+    flexDirection: "row",
+    gap: 8,
+    alignItems: "center",
   },
   statusMessage: {
     color: "rgba(75,245,255,0.92)",
